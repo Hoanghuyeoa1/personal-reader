@@ -1,0 +1,282 @@
+diff --git a/diagnostics/phase4_before_mediaSessionHelper.js.txt b/mediaSessionHelper.js
+index 80ad91b..9fb3558 100644
+--- a/diagnostics/phase4_before_mediaSessionHelper.js.txt
++++ b/mediaSessionHelper.js
+@@ -5,7 +5,18 @@
+  */
+ 
+ // Minimal 1-second silent WAV base64 string
+-const SILENT_WAV_BASE64 = 'data:audio/wav;base64,UklGRjIAAABXQVZFZm10IBIAAAABAAEAQB8AAEAfAAABAAgAAABmYWN0BAAAAAAAAABkYXRhAAAAAA==';
++const SILENT_WAV_BASE64 = (() => {
++  const bytes = new Uint8Array(8044);
++  const view = new DataView(bytes.buffer);
++  const label = (at, text) => [...text].forEach((c, i) => { bytes[at + i] = c.charCodeAt(0); });
++  label(0, 'RIFF'); view.setUint32(4, 8036, true); label(8, 'WAVE');
++  label(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
++  view.setUint16(22, 1, true); view.setUint32(24, 8000, true); view.setUint32(28, 8000, true);
++  view.setUint16(32, 1, true); view.setUint16(34, 8, true);
++  label(36, 'data'); view.setUint32(40, 8000, true); bytes.fill(128, 44);
++  return 'data:audio/wav;base64,' + btoa(String.fromCharCode(...bytes));
++})();
++const sessionOwners = new WeakMap();
+ 
+ export class MediaSessionHelper {
+   constructor(callbacks = {}) {
+@@ -24,6 +35,10 @@ export class MediaSessionHelper {
+     this.lastMetadata = null;
+     this._playPromise = null;
+     this._sessionToken = 0;
++    this.destroyed = false;
++    this._desiredPlaying = false;
++    this._handlingAction = false;
++    this._mediaSession = null;
+ 
+     this.initSilentAudio();
+     this.initActionHandlers();
+@@ -33,7 +48,7 @@ export class MediaSessionHelper {
+    * Initializes silent background audio element to keep OS Media Session alive.
+    */
+   initSilentAudio() {
+-    if (typeof window === 'undefined' || typeof Audio === 'undefined') return;
++    if (this.destroyed || this.silentAudio || typeof window === 'undefined' || typeof Audio === 'undefined') return;
+ 
+     try {
+       this.silentAudio = new Audio(SILENT_WAV_BASE64);
+@@ -49,72 +64,45 @@ export class MediaSessionHelper {
+    * Starts silent audio track when TTS starts speaking.
+    */
+   startBackgroundSession() {
+-    if (!this.silentAudio) return;
+-
++    if (this.destroyed) return;
++    this.initSilentAudio();
++    const audio = this.silentAudio;
++    if (!audio) return;
++    this._desiredPlaying = true;
++    this.setPlaybackState('playing');
++    if (this.isSilentAudioPlaying || this._playPromise) return;
+     const token = ++this._sessionToken;
+-
+-    if (!this.isSilentAudioPlaying) {
+-      try {
+-        const p = this.silentAudio.play();
+-        if (p && typeof p.then === 'function') {
+-          this._playPromise = p;
+-          p.then(() => {
+-            this._playPromise = null;
+-            if (this._sessionToken === token) {
+-              this.isSilentAudioPlaying = true;
+-            } else {
+-              // Token changed (e.g. paused/stopped while play was starting)
+-              try {
+-                this.silentAudio.pause();
+-              } catch (e) {}
+-              this.isSilentAudioPlaying = false;
+-            }
+-          }).catch(err => {
+-            this._playPromise = null;
+-            if (this._sessionToken === token) {
+-              this.isSilentAudioPlaying = false;
+-            }
+-            // May fail if not triggered directly by user gesture, will retry on next interaction
+-            console.debug('Silent audio play deferred:', err.message);
+-          });
+-        } else {
++    try {
++      const promise = Promise.resolve(audio.play());
++      this._playPromise = promise;
++      promise.then(() => {
++        if (this._playPromise === promise) this._playPromise = null;
++        if (!this.destroyed && this.silentAudio === audio && this._sessionToken === token && this._desiredPlaying) {
+           this.isSilentAudioPlaying = true;
++        } else if (this.silentAudio !== audio || !this._desiredPlaying) {
++          try { audio.pause(); } catch {}
+         }
+-      } catch (err) {
+-        this.isSilentAudioPlaying = false;
+-        console.debug('Silent audio play error:', err.message);
+-      }
++      }, err => {
++        if (this._playPromise === promise) this._playPromise = null;
++        if (this._sessionToken === token) this.isSilentAudioPlaying = false;
++        console.debug('Silent audio play deferred:', err?.message);
++      });
++    } catch (err) {
++      this.isSilentAudioPlaying = false;
++      console.debug('Silent audio play error:', err?.message);
+     }
+-
+-    this.setPlaybackState('playing');
+   }
+ 
+   /**
+    * Pauses silent audio track.
+    */
+   pauseBackgroundSession() {
+-    const token = ++this._sessionToken;
+-
+-    if (this.silentAudio && (this.isSilentAudioPlaying || this._playPromise)) {
+-      const doPause = () => {
+-        if (this._sessionToken !== token) return;
+-        try {
+-          this.silentAudio.pause();
+-          this.isSilentAudioPlaying = false;
+-        } catch (e) {}
+-      };
+-
+-      if (this._playPromise) {
+-        this._playPromise.then(doPause).catch(() => {
+-          if (this._sessionToken === token) {
+-            this.isSilentAudioPlaying = false;
+-          }
+-        });
+-      } else {
+-        doPause();
+-      }
+-    }
+-
++    if (this.destroyed) return;
++    this._sessionToken++;
++    this._desiredPlaying = false;
++    this._playPromise = null;
++    try { this.silentAudio?.pause(); } catch {}
++    this.isSilentAudioPlaying = false;
+     this.setPlaybackState('paused');
+   }
+ 
+@@ -122,29 +110,16 @@ export class MediaSessionHelper {
+    * Stops silent audio track completely.
+    */
+   stopBackgroundSession() {
+-    const token = ++this._sessionToken;
+-
+-    if (this.silentAudio && (this.isSilentAudioPlaying || this._playPromise)) {
+-      const doStop = () => {
+-        if (this._sessionToken !== token) return;
+-        try {
+-          this.silentAudio.pause();
+-          this.silentAudio.currentTime = 0;
+-          this.isSilentAudioPlaying = false;
+-        } catch (e) {}
+-      };
+-
+-      if (this._playPromise) {
+-        this._playPromise.then(doStop).catch(() => {
+-          if (this._sessionToken === token) {
+-            this.isSilentAudioPlaying = false;
+-          }
+-        });
+-      } else {
+-        doStop();
+-      }
++    this._sessionToken++;
++    this._desiredPlaying = false;
++    this._playPromise = null;
++    const audio = this.silentAudio;
++    this.silentAudio = null;
++    this.isSilentAudioPlaying = false;
++    if (audio) {
++      try { audio.pause(); audio.currentTime = 0; } catch {}
++      try { audio.removeAttribute?.('src'); audio.src = ''; audio.load?.(); } catch {}
+     }
+-
+     this.setPlaybackState('none');
+   }
+ 
+@@ -157,7 +132,7 @@ export class MediaSessionHelper {
+    * @param {string} [info.artworkUrl] - Custom artwork or generated SVG
+    */
+   updateMetadata(info = {}) {
+-    if (typeof navigator === 'undefined' || !('mediaSession' in navigator) || typeof MediaMetadata === 'undefined') {
++    if (this.destroyed || typeof navigator === 'undefined' || !('mediaSession' in navigator) || typeof MediaMetadata === 'undefined') {
+       return;
+     }
+ 
+@@ -187,7 +162,8 @@ export class MediaSessionHelper {
+    * @param {'none'|'paused'|'playing'} state
+    */
+   setPlaybackState(state) {
+-    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
++    if (this.destroyed || typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
++    if (sessionOwners.get(navigator.mediaSession) && sessionOwners.get(navigator.mediaSession) !== this) return;
+ 
+     try {
+       navigator.mediaSession.playbackState = state;
+@@ -202,23 +178,21 @@ export class MediaSessionHelper {
+   initActionHandlers() {
+     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+ 
++    this._mediaSession = navigator.mediaSession;
++    sessionOwners.set(this._mediaSession, this);
+     const actionMap = [
+       {
+         action: 'play',
+         handler: () => {
+-          this.startBackgroundSession();
+-          if (typeof this.callbacks.onPlay === 'function') {
+-            this.callbacks.onPlay();
+-          }
++          if (typeof this.callbacks.onPlay === 'function') this.callbacks.onPlay();
++          else this.startBackgroundSession();
+         }
+       },
+       {
+         action: 'pause',
+         handler: () => {
+-          this.pauseBackgroundSession();
+-          if (typeof this.callbacks.onPause === 'function') {
+-            this.callbacks.onPause();
+-          }
++          if (typeof this.callbacks.onPause === 'function') this.callbacks.onPause();
++          else this.pauseBackgroundSession();
+         }
+       },
+       {
+@@ -268,7 +242,11 @@ export class MediaSessionHelper {
+ 
+     actionMap.forEach(({ action, handler }) => {
+       try {
+-        navigator.mediaSession.setActionHandler(action, handler);
++        this._mediaSession.setActionHandler(action, details => {
++          if (this.destroyed || sessionOwners.get(this._mediaSession) !== this || this._handlingAction) return;
++          this._handlingAction = true;
++          try { handler(details); } finally { this._handlingAction = false; }
++        });
+       } catch (err) {
+         // Some actions might not be supported on all operating systems
+         console.debug(`Action handler [${action}] không được hỗ trợ:`, err.message);
+@@ -280,22 +258,20 @@ export class MediaSessionHelper {
+    * Cleans up silent audio and removes registered MediaSession action handlers.
+    */
+   destroy() {
++    if (this.destroyed) return;
+     this.stopBackgroundSession();
+-    if (this.silentAudio) {
+-      try {
+-        this.silentAudio.src = '';
+-        this.silentAudio.load?.();
+-      } catch {}
+-      this.silentAudio = null;
+-    }
+-    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+-      const actions = ['play', 'pause', 'previoustrack', 'nexttrack', 'seekbackward', 'seekforward', 'stop'];
+-      actions.forEach(action => {
+-        try {
+-          navigator.mediaSession.setActionHandler(action, null);
+-        } catch {}
+-      });
++    this.destroyed = true;
++    const session = this._mediaSession;
++    if (session && sessionOwners.get(session) === this) {
++      for (const action of ['play', 'pause', 'previoustrack', 'nexttrack', 'seekbackward', 'seekforward', 'stop']) {
++        try { session.setActionHandler(action, null); } catch {}
++      }
++      try { session.metadata = null; session.playbackState = 'none'; } catch {}
++      sessionOwners.delete(session);
+     }
++    this._mediaSession = null;
++    this.lastMetadata = null;
++    this.callbacks = {};
+   }
+ 
+   /**

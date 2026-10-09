@@ -1,0 +1,256 @@
+/**
+ * Sleep Timer & Gradual Fade-out Engine for VietReader (Audiobook & Sleep Suite)
+ * Handles minute-based countdowns, "End of Chapter" mode, and 30-second volume fade-out.
+ */
+
+export const SLEEP_TIMER_PRESETS = [
+  { minutes: 15, label: '15 phút' },
+  { minutes: 30, label: '30 phút' },
+  { minutes: 45, label: '45 phút' },
+  { minutes: 60, label: '60 phút' },
+  { mode: 'chapter_end', label: 'Hết chương hiện tại' }
+];
+
+export class SleepTimer {
+  /**
+   * @param {Object} [options]
+   * @param {number} [options.fadeDuration=30] - Seconds before expiration to start fade-out
+   * @param {Function} [options.onTick] - Called on each second tick: (status) => {}
+   * @param {Function} [options.onFade] - Called during 30s fade: (ratio: 1.0 -> 0.0) => {}
+   * @param {Function} [options.onExpire] - Called when timer finishes: ({ reason }) => {}
+   * @param {Function} [options.onCancel] - Called when timer is cancelled: () => {}
+   */
+  constructor(options = {}) {
+    this.fadeDuration = options.fadeDuration || 30;
+    this.onTick = options.onTick || null;
+    this.onFade = options.onFade || null;
+    this.onExpire = options.onExpire || null;
+    this.onCancel = options.onCancel || null;
+
+    this.mode = null; // 'time' | 'chapter_end' | null
+    this.totalSeconds = 0;
+    this.remainingSeconds = 0;
+    this.timerId = null;
+    this.isFading = false;
+    this.baseTtsVolume = 1.0;
+    this.baseAmbientVolume = 1.0;
+  }
+
+  /**
+   * Starts a timed countdown in minutes.
+   * @param {number} minutes
+   * @param {number} [baseTtsVolume=1.0]
+   * @param {number} [baseAmbientVolume=1.0]
+   */
+  start(minutes, baseTtsVolume = 1.0, baseAmbientVolume = 1.0) {
+    this.clearTimer();
+
+    const mins = Math.max(1, parseFloat(minutes) || 15);
+    this.mode = 'time';
+    this.totalSeconds = Math.round(mins * 60);
+    this.remainingSeconds = this.totalSeconds;
+    this.isFading = false;
+    this.baseTtsVolume = Math.max(0, Math.min(1, baseTtsVolume));
+    this.baseAmbientVolume = Math.max(0, Math.min(1, baseAmbientVolume));
+
+    // Emit initial tick
+    this.emitTick();
+
+    // Start 1-second interval
+    this.timerId = setInterval(() => {
+      this.tick();
+    }, 1000);
+    if (typeof this.timerId?.unref === 'function') {
+      this.timerId.unref();
+    }
+  }
+
+  /**
+   * Sets mode to "Dừng khi hết chương hiện tại".
+   * @param {number} [baseTtsVolume=1.0]
+   * @param {number} [baseAmbientVolume=1.0]
+   */
+  setChapterEndMode(baseTtsVolume = 1.0, baseAmbientVolume = 1.0) {
+    this.clearTimer();
+
+    this.mode = 'chapter_end';
+    this.totalSeconds = 0;
+    this.remainingSeconds = 0;
+    this.isFading = false;
+    this.baseTtsVolume = Math.max(0, Math.min(1, baseTtsVolume));
+    this.baseAmbientVolume = Math.max(0, Math.min(1, baseAmbientVolume));
+
+    this.emitTick();
+  }
+
+  /**
+   * Cancels the active sleep timer and restores full volume.
+   */
+  cancel() {
+    if (!this.mode) return;
+
+    this.clearTimer();
+
+    if (this.isFading && typeof this.onFade === 'function') {
+      this.onFade(1.0);
+    }
+
+    this.mode = null;
+    this.isFading = false;
+    this.remainingSeconds = 0;
+
+    if (typeof this.onCancel === 'function') {
+      this.onCancel();
+    }
+  }
+
+  /**
+   * Hook called when chapter reading completes.
+   */
+  notifyChapterEnd() {
+    if (this.mode === 'chapter_end') {
+      this.expire('chapter_end');
+    }
+  }
+
+  /**
+   * Returns true if currently in chapter_end mode or if chapter_end was triggered on completion.
+   */
+  isStopAtChapterEnd() {
+    return this.mode === 'chapter_end' || this.wasChapterEndTriggered === true;
+  }
+
+  /**
+   * Consumes and resets the chapter-end trigger flag.
+   */
+  consumeChapterEndTrigger() {
+    const triggered = this.wasChapterEndTriggered === true;
+    this.wasChapterEndTriggered = false;
+    return triggered;
+  }
+
+  /**
+   * Hook called during sentence chunk progression.
+   * If in chapter_end mode and near the last few chunks, can start gentle fade.
+   * @param {number} currentIndex
+   * @param {number} totalChunks
+   */
+  notifySentenceProgress(currentIndex, totalChunks) {
+    if (this.mode !== 'chapter_end' || totalChunks < 3) return;
+
+    const remainingChunks = totalChunks - 1 - currentIndex;
+    if (remainingChunks === 1) {
+      this.isFading = true;
+      if (typeof this.onFade === 'function') {
+        this.onFade(0.5);
+      }
+    } else if (remainingChunks <= 0) {
+      this.isFading = true;
+      if (typeof this.onFade === 'function') {
+        this.onFade(0.15);
+      }
+    } else if (this.isFading) {
+      this.isFading = false;
+      if (typeof this.onFade === 'function') {
+        this.onFade(1.0);
+      }
+    }
+  }
+
+  /**
+   * Internal per-second tick handler.
+   */
+  tick() {
+    if (this.mode !== 'time') return;
+
+    this.remainingSeconds--;
+
+    // Check 30s fade-out window
+    if (this.remainingSeconds <= this.fadeDuration && this.remainingSeconds > 0) {
+      this.isFading = true;
+      const ratio = Math.max(0, this.remainingSeconds / this.fadeDuration);
+      if (typeof this.onFade === 'function') {
+        this.onFade(ratio);
+      }
+    }
+
+    // Check expiration
+    if (this.remainingSeconds <= 0) {
+      if (typeof this.onFade === 'function') {
+        this.onFade(0);
+      }
+      this.expire('timer');
+      return;
+    }
+
+    this.emitTick();
+  }
+
+  /**
+   * Triggers timer expiration and cleans up.
+   * @param {'timer'|'chapter_end'} reason
+   */
+  expire(reason = 'timer') {
+    this.clearTimer();
+
+    const previousMode = this.mode;
+    if (reason === 'chapter_end' || previousMode === 'chapter_end') {
+      this.wasChapterEndTriggered = true;
+    }
+    this.mode = null;
+    this.isFading = false;
+    this.remainingSeconds = 0;
+
+    if (typeof this.onExpire === 'function') {
+      this.onExpire({ reason, previousMode });
+    }
+  }
+
+  /**
+   * Clears internal interval timer.
+   */
+  clearTimer() {
+    if (this.timerId) {
+      clearInterval(this.timerId);
+      this.timerId = null;
+    }
+  }
+
+  /**
+   * Emits current tick status to listener.
+   */
+  emitTick() {
+    if (typeof this.onTick === 'function') {
+      this.onTick(this.getStatus());
+    }
+  }
+
+  /**
+   * Returns current timer status object.
+   */
+  getStatus() {
+    return {
+      isActive: !!this.mode,
+      mode: this.mode,
+      remainingSeconds: this.remainingSeconds,
+      formatted: this.getFormattedTime(),
+      isFading: this.isFading
+    };
+  }
+
+  /**
+   * Formats remaining time into MM:SS or "Hết chương".
+   * @returns {string}
+   */
+  getFormattedTime() {
+    if (this.mode === 'chapter_end') {
+      return 'Hết chương';
+    }
+    if (this.mode === 'time') {
+      const mins = Math.floor(this.remainingSeconds / 60);
+      const secs = this.remainingSeconds % 60;
+      return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    }
+    return '';
+  }
+}

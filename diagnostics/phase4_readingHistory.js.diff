@@ -1,0 +1,37 @@
+diff --git a/diagnostics/phase4_before_readingHistory.js.txt b/readingHistory.js
+index f6ba522..6be683d 100644
+--- a/diagnostics/phase4_before_readingHistory.js.txt
++++ b/readingHistory.js
+@@ -203,6 +203,7 @@ export class ReadingHistoryEngine {
+     this.manuallyPaused = false;
+     this.pendingWrites = new Map();
+     this.flushTimer = null;
++    this.periodicFlushPending = false;
+     this.recoveryComplete = false;
+     this._isTransitioning = false;
+     this._persistedCheckpoints = new Map();
+@@ -383,7 +384,10 @@ export class ReadingHistoryEngine {
+   _startFlushTimer() {
+     if (this.flushTimer !== null || typeof this.setInterval !== 'function') return;
+     this.flushTimer = this.setInterval(() => {
+-      void this.flushSession().catch(error => this._logFailure('periodic flush', error));
++      if (this.periodicFlushPending) return;
++      this.periodicFlushPending = true;
++      void this.flushSession().catch(error => this._logFailure('periodic flush', error))
++        .finally(() => { this.periodicFlushPending = false; });
+     }, this.flushIntervalMs);
+     if (typeof this.flushTimer?.unref === 'function') {
+       this.flushTimer.unref();
+@@ -1149,9 +1153,9 @@ export const markChapterLeave = (index, timestamp) => readingHistory.markChapter
+ export const markChapterCompleted = (index, timestamp) => readingHistory.markChapterCompleted(index, timestamp);
+ export const recordChapterProgress = options => readingHistory.recordChapterProgress(options);
+ export const isChapterNearEnd = index => readingHistory.isChapterNearEnd(index);
+-export const markTtsStart = timestamp => readingHistory.markTtsStart(timestamp);
+-export const markTtsPause = timestamp => readingHistory.markTtsPause(timestamp);
+-export const markTtsStop = timestamp => readingHistory.markTtsStop(timestamp);
++export const markTtsStart = (timestamp, options) => readingHistory.markTtsStart(timestamp, options);
++export const markTtsPause = (timestamp, options) => readingHistory.markTtsPause(timestamp, options);
++export const markTtsStop = (timestamp, options) => readingHistory.markTtsStop(timestamp, options);
+ export const setVisibility = (visible, timestamp) => readingHistory.setVisibility(visible, timestamp);
+ export const setAutoScrollState = options => readingHistory.setAutoScrollState(options);
+ export const flushSession = timestamp => readingHistory.flushSession(timestamp);

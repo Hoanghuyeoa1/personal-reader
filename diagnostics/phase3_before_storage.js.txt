@@ -1,0 +1,1217 @@
+/**
+ * Storage Engine for Personal Reader Web App (VietReader)
+ * Uses Dexie.js (IndexedDB wrapper) for high-performance, unlimited local storage
+ */
+
+let db = null;
+const searchIndexListeners = new Set();
+const searchIndexSourceId = `search-${Math.random().toString(36).slice(2)}`;
+let searchIndexChannel = null;
+
+function getSearchIndexChannel() {
+  if (!searchIndexChannel && typeof globalThis.BroadcastChannel === 'function') {
+    searchIndexChannel = new BroadcastChannel('vietreader-search-index-mutations-v1');
+    searchIndexChannel.addEventListener('message', event => {
+      const change = event.data;
+      if (!change || change.sourceId === searchIndexSourceId) return;
+      for (const listener of searchIndexListeners) {
+        try { listener({ ...change, remote: true }); }
+        catch (error) { console.warn('Lỗi xử lý thông báo search index:', error); }
+      }
+    });
+  }
+  return searchIndexChannel;
+}
+
+function notifySearchIndexMutation(change) {
+  const message = { ...change, sourceId: searchIndexSourceId, changedAt: Date.now() };
+  for (const listener of searchIndexListeners) {
+    try { listener(message); }
+    catch (error) { console.warn('Lỗi xử lý thông báo search index:', error); }
+  }
+  try { getSearchIndexChannel()?.postMessage(message); }
+  catch (error) { console.warn('Lỗi phát thông báo search index:', error); }
+}
+
+export function subscribeSearchIndexChanges(listener) {
+  if (typeof listener !== 'function') return () => {};
+  searchIndexListeners.add(listener);
+  getSearchIndexChannel();
+  return () => {
+    searchIndexListeners.delete(listener);
+    if (!searchIndexListeners.size && searchIndexChannel) {
+      searchIndexChannel.close();
+      searchIndexChannel = null;
+    }
+  };
+}
+
+function getRuleScopes(rule) {
+  if (!rule || rule.bookId === null || rule.bookId === undefined || rule.bookId === 'global') {
+    return { global: true, bookIds: [] };
+  }
+  const id = Number(rule.bookId);
+  return Number.isFinite(id) ? { global: false, bookIds: [id] } : { global: true, bookIds: [] };
+}
+
+function notifyRulesChanged(...rules) {
+  const scopes = rules.filter(Boolean).map(getRuleScopes);
+  notifySearchIndexMutation({
+    type: 'rules-changed',
+    global: scopes.some(scope => scope.global),
+    bookIds: [...new Set(scopes.flatMap(scope => scope.bookIds))]
+  });
+}
+
+export function _resetDbForTesting() {
+  db = null;
+}
+
+export async function initDB() {
+  if (db) return db;
+
+  const DexieClass = (typeof window !== 'undefined' && window.Dexie) || globalThis.Dexie;
+  if (typeof DexieClass === 'undefined') {
+    throw new Error('Thư viện Dexie.js chưa được tải. Vui lòng kiểm tra kết nối mạng hoặc file CDN.');
+  }
+
+  const instance = new DexieClass('VietReaderDB');
+
+  // Schema definition
+  if (typeof instance.version === 'function') {
+    instance.version(1).stores({
+      books: '++id, title, author, totalChapters, currentChapterIndex, lastReadAt, createdAt',
+      chapters: '++id, [bookId+chapterIndex], bookId, chapterIndex, title',
+      settings: 'key'
+    });
+
+    instance.version(2).stores({
+      audioCache: 'key, provider, voice, createdAt'
+    });
+
+    instance.version(3).stores({
+      customRules: '++id, bookId, isEnabled, createdAt',
+      highlights: '++id, [bookId+chapterIndex], bookId, chapterIndex, paragraphIndex, createdAt'
+    });
+
+    instance.version(4).stores({
+      searchIndex: '[bookId+chapterIndex], bookId'
+    });
+
+    instance.version(5).stores({
+      bookmarks: '++id, bookId, [bookId+chapterIndex]'
+    });
+
+    instance.version(6).stores({
+      readingSessions: 'id, bookId, startedAt'
+    });
+  }
+
+  try {
+    if (typeof instance.open === 'function') {
+      await instance.open();
+    }
+    db = instance;
+    return db;
+  } catch (error) {
+    db = null;
+    throw error;
+  }
+}
+
+/**
+ * Saves a new book along with all its chapters within an atomic transaction.
+ * @param {Object} bookData - { title, author, coverGradient, wordCount, totalChapters }
+ * @param {Array<Object>} chaptersList - [{ chapterIndex, title, content, wordCount }]
+ * @returns {Promise<number>} - Newly created book ID
+ */
+export async function saveBookWithChapters(bookData, chaptersList) {
+  const database = await initDB();
+
+  const bookId = await database.transaction('rw', database.books, database.chapters, async () => {
+    const now = Date.now();
+    const bookRecord = {
+      title: bookData.title || 'Tác phẩm chưa đặt tên',
+      author: bookData.author || 'Khuyết danh',
+      coverGradient: bookData.coverGradient || getRandomGradient(),
+      totalChapters: chaptersList.length,
+      currentChapterIndex: 0,
+      currentChunkIndex: 0, // Lưu chỉ mục câu/đoạn đọc TTS ban đầu mặc định là 0
+      scrollProgress: 0,
+      scrollY: 0,
+      wordCount: bookData.wordCount || chaptersList.reduce((acc, c) => acc + (c.wordCount || 0), 0),
+      createdAt: now,
+      lastReadAt: now
+    };
+
+    const bookId = await database.books.add(bookRecord);
+
+    // Prepare chapters with foreign key bookId
+    const chapterRecords = chaptersList.map((ch, idx) => ({
+      bookId,
+      chapterIndex: idx,
+      title: ch.title || `Chương ${idx + 1}`,
+      content: ch.content || '',
+      wordCount: ch.wordCount || (ch.content ? ch.content.trim().split(/\s+/).length : 0)
+    }));
+
+    await database.chapters.bulkAdd(chapterRecords);
+    return bookId;
+  });
+  notifySearchIndexMutation({ type: 'book-added', bookId });
+  return bookId;
+}
+
+/**
+ * Retrieves all books sorted by lastReadAt descending.
+ */
+export async function getAllBooks() {
+  const database = await initDB();
+  return await database.books.orderBy('lastReadAt').reverse().toArray();
+}
+
+/**
+ * Gets a specific book by ID.
+ */
+export async function getBook(bookId) {
+  const database = await initDB();
+  return await database.books.get(Number(bookId));
+}
+
+/**
+ * Gets metadata of all chapters for a book (omits full content for speed).
+ */
+export async function getBookChaptersMeta(bookId) {
+  const database = await initDB();
+  const list = await database.chapters
+    .where('bookId')
+    .equals(Number(bookId))
+    .sortBy('chapterIndex');
+
+  return list.map(ch => ({
+    id: ch.id,
+    chapterIndex: ch.chapterIndex,
+    title: ch.title,
+    wordCount: ch.wordCount
+  }));
+}
+
+/**
+ * Gets full content of a specific chapter.
+ */
+export async function getChapter(bookId, chapterIndex) {
+  const database = await initDB();
+  return await database.chapters
+    .where('[bookId+chapterIndex]')
+    .equals([Number(bookId), Number(chapterIndex)])
+    .first();
+}
+
+// Search index is a derived cache. These APIs never participate in book or
+// chapter source writes, and callers should treat failures as cache misses.
+export async function getSearchIndexEntry(bookId, chapterIndex) {
+  const database = await initDB();
+  return database.searchIndex.get([Number(bookId), Number(chapterIndex)]);
+}
+
+/** Reads source and its cache row from one consistent readonly transaction. */
+export async function getSearchIndexSnapshot(bookId, chapterIndex) {
+  const database = await initDB();
+  return database.transaction(
+    'r', database.searchIndex, database.books, database.chapters,
+    database.customRules, database.settings,
+    async () => {
+      const numericBookId = Number(bookId);
+      const numericChapterIndex = Number(chapterIndex);
+      const [book, chapter, allRules, setting, indexEntry] = await Promise.all([
+        database.books.get(numericBookId),
+        database.chapters.where('[bookId+chapterIndex]').equals([numericBookId, numericChapterIndex]).first(),
+        database.customRules.toArray(),
+        database.settings.get('enableGlobalCleaner'),
+        database.searchIndex.get([numericBookId, numericChapterIndex])
+      ]);
+      return {
+        book,
+        chapter,
+        rules: allRules.filter(rule => rule.bookId === null || rule.bookId === undefined || rule.bookId === 'global'
+          || Number(rule.bookId) === numericBookId),
+        enableCleaner: setting ? setting.value !== false : true,
+        indexEntry
+      };
+    }
+  );
+}
+
+export async function getSearchIndexForBook(bookId) {
+  const database = await initDB();
+  return database.searchIndex.where('bookId').equals(Number(bookId)).toArray();
+}
+
+export async function getAllSearchIndexEntries() {
+  const database = await initDB();
+  return database.searchIndex.toArray();
+}
+
+export async function putSearchIndexEntry(entry) {
+  const database = await initDB();
+  return database.searchIndex.put(entry);
+}
+
+export async function deleteSearchIndexChapter(bookId, chapterIndex) {
+  const database = await initDB();
+  return database.searchIndex.delete([Number(bookId), Number(chapterIndex)]);
+}
+
+export async function deleteSearchIndexForBook(bookId) {
+  const database = await initDB();
+  return database.searchIndex.where('bookId').equals(Number(bookId)).delete();
+}
+
+export async function clearSearchIndex() {
+  const database = await initDB();
+  return database.searchIndex.clear();
+}
+
+export async function getAllChapterKeys() {
+  const database = await initDB();
+  const chapters = await database.chapters.toArray();
+  return chapters.map(chapter => ({ bookId: chapter.bookId, chapterIndex: chapter.chapterIndex }));
+}
+
+/**
+ * Revalidate the source snapshot and cache put in one read/write transaction.
+ * The callback must be synchronous and must not mutate source records.
+ */
+export async function commitSearchIndexEntryIfCurrent(entry, validateSnapshot) {
+  const database = await initDB();
+  return database.transaction(
+    'rw', database.searchIndex, database.books, database.chapters,
+    database.customRules, database.settings,
+    async () => {
+      const book = await database.books.get(Number(entry.bookId));
+      if (!book) return false;
+      const chapter = await database.chapters
+        .where('[bookId+chapterIndex]')
+        .equals([Number(entry.bookId), Number(entry.chapterIndex)])
+        .first();
+      if (!chapter) return false;
+      const rules = (await database.customRules.toArray()).filter(rule =>
+        rule.bookId === null || rule.bookId === undefined || rule.bookId === 'global'
+        || Number(rule.bookId) === Number(entry.bookId)
+      );
+      const setting = await database.settings.get('enableGlobalCleaner');
+      const snapshot = {
+        book,
+        chapter,
+        rules,
+        enableCleaner: setting ? setting.value !== false : true
+      };
+      if (!validateSnapshot(snapshot)) return false;
+      await database.searchIndex.put(entry);
+      return true;
+    }
+  );
+}
+
+/**
+ * Updates reading progress for a book.
+ */
+export async function updateProgress(bookId, chapterIndex, scrollProgress = 0, scrollY = 0, currentChunkIndex = 0) {
+  const database = await initDB();
+  return await database.books.update(Number(bookId), {
+    currentChapterIndex: Number(chapterIndex),
+    currentChunkIndex: Math.max(0, Number(currentChunkIndex)),
+    scrollProgress: Math.min(100, Math.max(0, Math.round(scrollProgress))),
+    scrollY: Math.max(0, Math.round(scrollY)),
+    lastReadAt: Date.now()
+  });
+}
+
+/**
+ * Deletes a book and all associated chapters.
+ */
+export async function deleteBook(bookId) {
+  const database = await initDB();
+  const result = await database.transaction('rw', database.books, database.chapters, database.bookmarks, database.readingSessions, async () => {
+    await database.chapters.where('bookId').equals(Number(bookId)).delete();
+    await database.bookmarks.where('bookId').equals(Number(bookId)).delete();
+    await database.readingSessions.where('bookId').equals(Number(bookId)).delete();
+    await database.books.delete(Number(bookId));
+  });
+  try { await deleteSearchIndexForBook(bookId); }
+  catch (error) { console.warn(`Lỗi xóa search index của sách [${bookId}]:`, error); }
+  notifySearchIndexMutation({ type: 'book-deleted', bookId: Number(bookId) });
+  return result;
+}
+
+/**
+ * Gets a persistent setting value.
+ */
+export async function getSetting(key, defaultValue = null) {
+  try {
+    const database = await initDB();
+    const record = await database.settings.get(key);
+    return record ? record.value : defaultValue;
+  } catch (err) {
+    console.warn(`Lỗi đọc cài đặt [${key}]:`, err);
+    return defaultValue;
+  }
+}
+
+/**
+ * Saves a persistent setting value.
+ */
+export async function setSetting(key, value) {
+  try {
+    const database = await initDB();
+    await database.settings.put({ key, value });
+    if (key === 'enableGlobalCleaner') {
+      notifySearchIndexMutation({ type: 'cleaner-setting-changed' });
+    }
+  } catch (err) {
+    console.warn(`Lỗi lưu cài đặt [${key}]:`, err);
+  }
+}
+
+/** Persists one user-owned reading session/checkpoint. */
+export async function putReadingSession(session) {
+  const database = await initDB();
+  return database.readingSessions.put({ ...session, bookId: Number(session.bookId) });
+}
+
+/** Returns a book's sessions in chronological order, optionally bounded by start time. */
+export async function getReadingSessions({ bookId, from, to, limit } = {}) {
+  const database = await initDB();
+  if (limit === 0) return [];
+  if ((bookId === undefined || bookId === null) && from === undefined && to === undefined
+    && Number.isSafeInteger(limit) && limit > 0
+    && typeof database.readingSessions.orderBy === 'function') {
+    // The startedAt index can return the newest page without materializing all
+    // historical rows. Keep the result in chronological order for this API.
+    try {
+      const recent = await database.readingSessions.orderBy('startedAt').reverse().limit(limit).toArray();
+      return recent.sort((a, b) => Number(a.startedAt) - Number(b.startedAt));
+    } catch {
+      // Non-Dexie test adapters may expose orderBy incompletely; retain the safe fallback.
+    }
+  }
+  const rows = bookId === undefined || bookId === null
+    ? await database.readingSessions.toArray()
+    : await database.readingSessions.where('bookId').equals(Number(bookId)).toArray();
+  const filtered = rows.filter(session => {
+    const startedAt = Number(session.startedAt);
+    return (from === undefined || startedAt >= Number(from))
+      && (to === undefined || startedAt < Number(to));
+  }).sort((a, b) => Number(a.startedAt) - Number(b.startedAt));
+  if (limit === 0) return [];
+  return Number.isSafeInteger(limit) && limit > 0 ? filtered.slice(-limit) : filtered;
+}
+
+export async function getUnfinishedReadingSessions() {
+  const database = await initDB();
+  return (await database.readingSessions.toArray()).filter(session => session.endedAt === null || session.endedAt === undefined);
+}
+
+/** Deletes only one Reading History record. */
+export async function deleteReadingSession(id) {
+  const database = await initDB();
+  if (!await database.readingSessions.get(id)) return false;
+  await database.readingSessions.delete(id);
+  return true;
+}
+
+/** Clears Reading History rows without changing books or any reader state. */
+export async function clearReadingHistory() {
+  const database = await initDB();
+  await database.readingSessions.clear();
+  return true;
+}
+
+export async function deleteReadingSessionsForBook(bookId) {
+  const database = await initDB();
+  return database.readingSessions.where('bookId').equals(Number(bookId)).delete();
+}
+
+/**
+ * Exports entire database as a structured JSON object.
+ */
+export async function exportDatabase() {
+  const database = await initDB();
+  const books = await database.books.toArray();
+  const chapters = await database.chapters.toArray();
+  const settings = await database.settings.toArray();
+  const customRules = await database.customRules.toArray();
+  const highlights = await database.highlights.toArray();
+  const bookmarks = await database.bookmarks.toArray();
+  const readingSessions = await database.readingSessions.toArray();
+
+  return {
+    version: 5,
+    appName: 'VietReader',
+    exportedAt: new Date().toISOString(),
+    books,
+    chapters,
+    settings,
+    customRules,
+    highlights,
+    bookmarks,
+    readingSessions
+  };
+}
+
+/**
+ * Imports a JSON dump into the database.
+ * @param {Object} data - Parsed JSON data
+ * @param {boolean} clearExisting - Whether to wipe current data before import
+ */
+export async function importDatabase(data, clearExisting = false) {
+  if (!data || !Array.isArray(data.books) || !Array.isArray(data.chapters)) {
+    throw new Error('Định dạng file sao lưu không hợp lệ.');
+  }
+  if (data.bookmarks !== undefined && !Array.isArray(data.bookmarks)) {
+    throw new Error('Danh sách bookmark trong file sao lưu không hợp lệ.');
+  }
+  if (data.readingSessions !== undefined && !Array.isArray(data.readingSessions)) {
+    throw new Error('Danh sách lịch sử đọc trong file sao lưu không hợp lệ.');
+  }
+
+  // Validate and normalize before a replace import clears any existing data.
+  // Missing bookmarks means an older compatible backup; malformed/orphan
+  // bookmark rows reject the backup instead of silently discarding user data.
+  const importedBookmarks = normalizeImportedBookmarks(
+    data.bookmarks || [], data.books, data.chapters
+  );
+  const importedReadingSessions = normalizeImportedReadingSessions(
+    data.readingSessions || [], data.books
+  );
+
+  const database = await initDB();
+
+  const result = await database.transaction('rw', database.books, database.chapters, database.settings, database.customRules, database.highlights, database.bookmarks, database.readingSessions, async () => {
+    if (clearExisting) {
+      await database.books.clear();
+      await database.chapters.clear();
+      await database.settings.clear();
+      await database.customRules.clear();
+      await database.highlights.clear();
+      await database.bookmarks.clear();
+      await database.readingSessions.clear();
+    }
+
+    // Remap IDs if appending, or directly insert if clearing
+    if (clearExisting) {
+      await database.books.bulkAdd(data.books);
+      await database.chapters.bulkAdd(data.chapters);
+      if (data.settings && data.settings.length > 0) {
+        await database.settings.bulkPut(data.settings);
+      }
+      if (data.customRules && data.customRules.length > 0) {
+        await database.customRules.bulkAdd(data.customRules);
+      }
+      if (data.highlights && data.highlights.length > 0) {
+        await database.highlights.bulkAdd(data.highlights);
+      }
+      if (importedBookmarks.length) await database.bookmarks.bulkAdd(importedBookmarks);
+      if (importedReadingSessions.length) await database.readingSessions.bulkAdd(importedReadingSessions);
+    } else {
+      // Append mode: generate new IDs for books and update chapter references
+      const remappedBookIds = new Map();
+      for (const b of data.books) {
+        const oldId = b.id;
+        const normalizedOldId = backupSafeInteger(oldId, 1);
+        const newBookRecord = { ...b };
+        delete newBookRecord.id;
+        const newId = await database.books.add(newBookRecord);
+        remappedBookIds.set(String(oldId), newId);
+        if (normalizedOldId !== null) remappedBookIds.set(String(normalizedOldId), newId);
+
+        const bookChapters = data.chapters.filter(ch =>
+          (backupSafeInteger(ch.bookId, 1) ?? String(ch.bookId)) === (normalizedOldId ?? oldId));
+        const newChapterRecords = bookChapters.map(ch => {
+          const newCh = { ...ch, bookId: newId };
+          delete newCh.id;
+          return newCh;
+        });
+
+        if (newChapterRecords.length > 0) {
+          await database.chapters.bulkAdd(newChapterRecords);
+        }
+
+        // Remap highlights for this book
+        if (data.highlights && data.highlights.length > 0) {
+          const bookHighlights = data.highlights.filter(hl =>
+            (backupSafeInteger(hl.bookId, 1) ?? String(hl.bookId)) === (normalizedOldId ?? oldId));
+          for (const hl of bookHighlights) {
+            const newHl = { ...hl, bookId: newId };
+            delete newHl.id;
+            await database.highlights.add(newHl);
+          }
+        }
+      }
+
+      if (importedBookmarks.length) {
+        const remappedBookmarks = importedBookmarks.map(bookmark => {
+          const bookId = remappedBookIds.get(String(bookmark.bookId));
+          if (!Number.isSafeInteger(bookId) || bookId < 1) {
+            throw new Error('Không thể liên kết bookmark với sách sau khi khôi phục.');
+          }
+          const record = { ...bookmark, bookId };
+          delete record.id;
+          return record;
+        });
+        await database.bookmarks.bulkAdd(remappedBookmarks);
+      }
+
+      if (importedReadingSessions.length) {
+        const remappedSessions = importedReadingSessions.map(session => {
+          const bookId = remappedBookIds.get(String(session.bookId));
+          if (!Number.isSafeInteger(bookId) || bookId < 1) {
+            throw new Error('Không thể liên kết lịch sử đọc với sách sau khi khôi phục.');
+          }
+          return { ...session, id: createBackupRecordId(), bookId };
+        });
+        await database.readingSessions.bulkAdd(remappedSessions);
+      }
+
+      // Append custom rules
+      if (data.customRules && data.customRules.length > 0) {
+        for (const rule of data.customRules) {
+          const remappedBookId = rule.bookId === null || rule.bookId === undefined || rule.bookId === 'global'
+            ? rule.bookId
+            : (remappedBookIds.get(String(rule.bookId)) ?? rule.bookId);
+          const newRule = { ...rule, bookId: remappedBookId };
+          delete newRule.id;
+          await database.customRules.add(newRule);
+        }
+      }
+    }
+  });
+  try { await clearSearchIndex(); }
+  catch (error) { console.warn('Lỗi xóa search index sau khi khôi phục dữ liệu:', error); }
+  notifySearchIndexMutation({ type: 'database-restored', mode: clearExisting ? 'replace' : 'append' });
+  return result;
+}
+
+function createBackupRecordId() {
+  return globalThis.crypto?.randomUUID?.()
+    || `vr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function normalizeImportedReadingSessions(sessions, books) {
+  const importedBookIds = new Set(books
+    .map(book => backupSafeInteger(book?.id, 1))
+    .filter(id => id !== null)
+    .map(String));
+  const ids = new Set();
+  return sessions.map((source, index) => {
+    const label = `Reading session ${index + 1}`;
+    if (!source || typeof source !== 'object' || Array.isArray(source)) {
+      throw new Error(`${label} trong file sao lưu không hợp lệ.`);
+    }
+    const bookId = backupSafeInteger(source.bookId, 1);
+    const startedAt = backupSafeInteger(source.startedAt);
+    if (bookId === null || !importedBookIds.has(String(bookId))) {
+      throw new Error(`${label} không liên kết với sách trong file sao lưu.`);
+    }
+    if (startedAt === null) throw new Error(`${label} có thời điểm bắt đầu không hợp lệ.`);
+
+    const id = typeof source.id === 'string' && source.id.trim()
+      ? source.id.trim()
+      : (backupSafeInteger(source.id, 1) ?? null);
+    if (id === null || ids.has(String(id))) throw new Error(`${label} có ID không hợp lệ hoặc bị trùng.`);
+    ids.add(String(id));
+
+    const finiteDuration = value => {
+      const number = Number(value ?? 0);
+      return Number.isFinite(number) && number >= 0 ? Math.floor(number) : null;
+    };
+    const activeDurationMs = finiteDuration(source.activeDurationMs);
+    const ttsDurationMs = finiteDuration(source.ttsDurationMs);
+    const safeCheckpointAt = backupSafeInteger(source.safeCheckpointAt) ?? startedAt;
+    const lastActivityAt = backupSafeInteger(source.lastActivityAt) ?? startedAt;
+    const endedAt = source.endedAt === null || source.endedAt === undefined
+      ? null
+      : backupSafeInteger(source.endedAt);
+    if (activeDurationMs === null || ttsDurationMs === null || ttsDurationMs > activeDurationMs
+      || safeCheckpointAt < startedAt || lastActivityAt < startedAt || lastActivityAt > safeCheckpointAt
+      || (endedAt !== null && (endedAt < startedAt || endedAt > safeCheckpointAt))) {
+      throw new Error(`${label} có thời lượng hoặc checkpoint không hợp lệ.`);
+    }
+
+    const chapterIndex = value => value === null || value === undefined
+      ? null
+      : backupSafeInteger(value);
+    const startChapterIndex = chapterIndex(source.startChapterIndex);
+    const endChapterIndex = chapterIndex(source.endChapterIndex);
+    const wordsReadEstimate = finiteDuration(source.wordsReadEstimate);
+    const chaptersCompleted = finiteDuration(source.chaptersCompleted);
+    const completedChapterIndexes = source.completedChapterIndexes === undefined
+      ? []
+      : Array.isArray(source.completedChapterIndexes)
+        ? source.completedChapterIndexes.map(value => backupSafeInteger(value))
+        : null;
+    if (wordsReadEstimate === null || chaptersCompleted === null
+      || completedChapterIndexes === null || completedChapterIndexes.some(value => value === null)
+      || (source.startChapterIndex !== null && source.startChapterIndex !== undefined && startChapterIndex === null)
+      || (source.endChapterIndex !== null && source.endChapterIndex !== undefined && endChapterIndex === null)) {
+      throw new Error(`${label} có metrics không hợp lệ.`);
+    }
+
+    if (source.dailyBuckets !== undefined && !Array.isArray(source.dailyBuckets)) {
+      throw new Error(`${label} có daily buckets không hợp lệ.`);
+    }
+    const dailyBuckets = Array.isArray(source.dailyBuckets) ? source.dailyBuckets.map(bucket => {
+      if (!bucket || typeof bucket.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(bucket.date)) {
+        throw new Error(`${label} có daily bucket không hợp lệ.`);
+      }
+      const active = finiteDuration(bucket.activeDurationMs);
+      const tts = finiteDuration(bucket.ttsDurationMs);
+      const words = finiteDuration(bucket.wordsReadEstimate);
+      const completed = finiteDuration(bucket.chaptersCompleted);
+      if ([active, tts, words, completed].some(value => value === null) || tts > active) {
+        throw new Error(`${label} có daily bucket metrics không hợp lệ.`);
+      }
+      return { date: bucket.date, activeDurationMs: active, ttsDurationMs: tts,
+        wordsReadEstimate: words, chaptersCompleted: completed };
+    }) : [];
+
+    if (source.hourlyBuckets !== undefined && !Array.isArray(source.hourlyBuckets)) {
+      throw new Error(`${label} có hourly buckets không hợp lệ.`);
+    }
+    const hourlyBuckets = Array.isArray(source.hourlyBuckets) ? source.hourlyBuckets.map(bucket => {
+      if (!bucket || typeof bucket.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(bucket.date)) {
+        throw new Error(`${label} có hourly bucket không hợp lệ.`);
+      }
+      const [year, month, day] = bucket.date.split('-').map(Number);
+      const date = new Date(year, month - 1, day);
+      if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) {
+        throw new Error(`${label} có hourly bucket date không hợp lệ.`);
+      }
+      if (!Array.isArray(bucket.activeDurationMs) || bucket.activeDurationMs.length !== 24
+        || !Array.isArray(bucket.ttsDurationMs) || bucket.ttsDurationMs.length !== 24) {
+        throw new Error(`${label} có hourly bucket metrics không hợp lệ.`);
+      }
+      const active = bucket.activeDurationMs.map(finiteDuration);
+      const tts = bucket.ttsDurationMs.map(finiteDuration);
+      if ([...active, ...tts].some(value => value === null)
+        || tts.some((value, hour) => value > active[hour])) {
+        throw new Error(`${label} có hourly bucket metrics không hợp lệ.`);
+      }
+      return { date: bucket.date, activeDurationMs: active, ttsDurationMs: tts };
+    }) : [];
+
+    return {
+      id,
+      bookId,
+      startedAt,
+      endedAt,
+      activeDurationMs,
+      ttsDurationMs,
+      startChapterIndex,
+      endChapterIndex,
+      wordsReadEstimate,
+      chaptersCompleted,
+      completedChapterIndexes: [...new Set(completedChapterIndexes)],
+      safeCheckpointAt,
+      lastActivityAt,
+      dailyBuckets,
+      hourlyBuckets
+    };
+  });
+}
+
+function backupSafeInteger(value, minimum = 0) {
+  if (!(typeof value === 'number' || (typeof value === 'string' && value.trim() !== ''))) return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= minimum ? number : null;
+}
+
+function normalizeImportedBookmarks(bookmarks, books, chapters) {
+  const importedBookIds = new Set(books
+    .map(book => backupSafeInteger(book?.id, 1))
+    .filter(id => id !== null)
+    .map(String));
+  const importedChapters = new Set(chapters
+    .map(chapter => ({
+      bookId: backupSafeInteger(chapter?.bookId, 1),
+      chapterIndex: backupSafeInteger(chapter?.chapterIndex)
+    }))
+    .filter(chapter => chapter.bookId !== null && chapter.chapterIndex !== null)
+    .map(chapter => `${chapter.bookId}:${chapter.chapterIndex}`));
+  const unique = new Map();
+  const fallbackTimestamp = Date.now();
+
+  for (const [index, source] of bookmarks.entries()) {
+    const rowLabel = `Bookmark ${index + 1}`;
+    if (!source || typeof source !== 'object' || Array.isArray(source)) {
+      throw new Error(`${rowLabel} trong file sao lưu không hợp lệ.`);
+    }
+    const oldBookId = source.bookId;
+    const bookIdNumber = backupSafeInteger(oldBookId, 1);
+    if (bookIdNumber === null || !importedBookIds.has(String(bookIdNumber))) {
+      throw new Error(`${rowLabel} không liên kết với sách trong file sao lưu.`);
+    }
+    const chapterIndex = backupSafeInteger(source.chapterIndex);
+    const paragraphIndex = backupSafeInteger(source.paragraphIndex);
+    if (chapterIndex === null || paragraphIndex === null) {
+      throw new Error(`${rowLabel} có chỉ mục chương hoặc đoạn không hợp lệ.`);
+    }
+    if (!importedChapters.has(`${bookIdNumber}:${chapterIndex}`)) {
+      throw new Error(`${rowLabel} trỏ đến chương không có trong file sao lưu.`);
+    }
+
+    const bookId = bookIdNumber;
+    const key = `${bookId}:${chapterIndex}:${paragraphIndex}`;
+
+    const textAnchor = typeof source.textAnchor === 'string' ? source.textAnchor.trim() : '';
+    const previewText = typeof source.previewText === 'string' ? source.previewText.trim() : '';
+    const createdAt = backupSafeInteger(source.createdAt) ?? fallbackTimestamp;
+    const updatedAt = backupSafeInteger(source.updatedAt) ?? createdAt;
+    const record = {
+      bookId,
+      chapterIndex,
+      paragraphIndex,
+      textAnchor: textAnchor.slice(0, 240),
+      prefixContext: typeof source.prefixContext === 'string' ? source.prefixContext.slice(0, 120) : '',
+      suffixContext: typeof source.suffixContext === 'string' ? source.suffixContext.slice(0, 120) : '',
+      previewText: (previewText || textAnchor).replace(/\s+/gu, ' ').slice(0, 180),
+      createdAt,
+      updatedAt
+    };
+    if (typeof source.label === 'string' && source.label.trim()) record.label = source.label.trim().slice(0, 120);
+    const anchorVersion = backupSafeInteger(source.anchorVersion, 1);
+    if (anchorVersion !== null) record.anchorVersion = anchorVersion;
+    const chunkIndex = backupSafeInteger(source.chunkIndex);
+    if (chunkIndex !== null) record.chunkIndex = chunkIndex;
+    if (source.id !== null && source.id !== undefined) {
+      const id = backupSafeInteger(source.id, 1);
+      if (id === null) throw new Error(`${rowLabel} có ID không hợp lệ.`);
+      record.id = id;
+    }
+
+    const existing = unique.get(key);
+    if (!existing) {
+      unique.set(key, record);
+      continue;
+    }
+
+    // Duplicate logical positions collapse deterministically. Keep the most
+    // recently edited record's label and anchor metadata, and the first ID on
+    // replace restores to avoid creating a conflicting primary key.
+    const winner = record.updatedAt > existing.updatedAt ? record : existing;
+    const loser = winner === record ? existing : record;
+    const merged = { ...loser, ...winner, createdAt: Math.min(existing.createdAt, record.createdAt) };
+    if (Object.hasOwn(winner, 'label')) merged.label = winner.label;
+    else if (record.updatedAt === existing.updatedAt && Object.hasOwn(loser, 'label')) merged.label = loser.label;
+    else delete merged.label;
+    if (existing.id !== undefined) merged.id = existing.id;
+    unique.set(key, merged);
+  }
+
+  const ids = new Set();
+  for (const record of unique.values()) {
+    if (record.id === undefined) continue;
+    if (ids.has(record.id)) throw new Error('File sao lưu có ID bookmark bị trùng ở các vị trí khác nhau.');
+    ids.add(record.id);
+  }
+  return [...unique.values()];
+}
+
+/**
+ * Generates an aesthetic random modern CSS gradient for book cover cards.
+ */
+export function getRandomGradient() {
+  const gradients = [
+    'linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%)', // Indigo to Violet
+    'linear-gradient(135deg, #0284c7 0%, #0d9488 100%)', // Sky to Teal
+    'linear-gradient(135deg, #e11d48 0%, #be185d 100%)', // Rose to Pink
+    'linear-gradient(135deg, #d97706 0%, #ea580c 100%)', // Amber to Orange
+    'linear-gradient(135deg, #059669 0%, #10b981 100%)', // Emerald
+    'linear-gradient(135deg, #7c2d12 0%, #9a3412 100%)', // Warm Mahogany
+    'linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%)', // Blue to Purple
+    'linear-gradient(135deg, #0f172a 0%, #334155 100%)'  // Slate Charcoal
+  ];
+  return gradients[Math.floor(Math.random() * gradients.length)];
+}
+
+/**
+ * Retrieves cached audio blob from IndexedDB by key with integrity validation.
+ * @param {string} key
+ * @param {Object|null} validation - Optional expected { provider, voice, model }
+ * @returns {Promise<Blob|null>}
+ */
+export async function getCachedAudio(key, validation = null) {
+  try {
+    const database = await initDB();
+    if (!database || !database.audioCache) return null;
+    const item = await database.audioCache.get(key);
+    if (!item || !item.blob) return null;
+
+    const blob = item.blob;
+    // Check blob validity / corruption
+    if (typeof blob.size === 'number' && blob.size <= 0) {
+      console.warn(`[audioCache] Phát hiện entry rỗng/hỏng [${key}], dọn dẹp khỏi cache.`);
+      database.audioCache.delete(key).catch(() => {});
+      return null;
+    }
+
+    // Verify metadata if validation requirements provided
+    if (validation && typeof validation === 'object') {
+      if (validation.provider && item.provider && item.provider !== 'cloud') {
+        const normItemProvider = String(item.provider).toLowerCase().trim();
+        const normExpectedProvider = String(validation.provider).toLowerCase().trim();
+        if (normItemProvider !== normExpectedProvider) {
+          return null; // Provider mismatch
+        }
+      }
+      if (validation.voice && item.voice) {
+        const normItemVoice = String(item.voice).toLowerCase().replace(/^(fpt|openai):/, '').trim();
+        const normExpectedVoice = String(validation.voice).toLowerCase().replace(/^(fpt|openai):/, '').trim();
+        if (normItemVoice !== normExpectedVoice) {
+          return null; // Voice mismatch
+        }
+      }
+      if (validation.model && item.model) {
+        const normItemModel = String(item.model).toLowerCase().trim();
+        const normExpectedModel = String(validation.model).toLowerCase().trim();
+        if (normItemModel !== normExpectedModel) {
+          return null; // Model mismatch
+        }
+      } else if (validation.model && validation.model !== 'tts-1' && !item.model) {
+        // Expected specialized model (e.g. tts-1-hd) but legacy item has no model recorded
+        return null;
+      }
+    }
+
+    return blob;
+  } catch (err) {
+    console.warn(`Lỗi đọc audio cache [${key}]:`, err);
+    return null;
+  }
+}
+
+/**
+ * Stores an audio chunk blob in IndexedDB cache with metadata and QuotaExceeded protection.
+ * @param {string} key
+ * @param {Blob} blob
+ * @param {string} provider
+ * @param {string} voice
+ * @param {Object} metadata - Optional { model, rate, textHash }
+ */
+export async function setCachedAudio(key, blob, provider = 'cloud', voice = '', metadata = {}) {
+  if (!blob || (typeof blob.size === 'number' && blob.size <= 0)) {
+    return; // Don't cache empty or null blobs
+  }
+  try {
+    const database = await initDB();
+    if (!database || !database.audioCache) return;
+
+    const record = {
+      key,
+      blob,
+      provider: provider || 'cloud',
+      voice: voice || '',
+      model: (metadata && metadata.model) || '',
+      rate: (metadata && metadata.rate !== undefined) ? metadata.rate : null,
+      textHash: (metadata && metadata.textHash) || '',
+      version: 2,
+      createdAt: Date.now()
+    };
+
+    try {
+      await database.audioCache.put(record);
+    } catch (putErr) {
+      if (putErr && (putErr.name === 'QuotaExceededError' || putErr.code === 22)) {
+        console.warn('IndexedDB QuotaExceededError khi lưu audio cache. Đang dọn dẹp các bản ghi cũ...');
+        try {
+          if (typeof database.audioCache.orderBy === 'function') {
+            const oldestKeys = await database.audioCache.orderBy('createdAt').limit(30).keys();
+            if (oldestKeys.length > 0) {
+              await database.audioCache.bulkDelete(oldestKeys);
+              await database.audioCache.put(record);
+              return;
+            }
+          }
+        } catch (evictErr) {
+          console.warn('Không thể tự động dọn dẹp audio cache sau QuotaExceeded:', evictErr);
+        }
+      } else {
+        throw putErr;
+      }
+    }
+  } catch (err) {
+    console.warn(`Lỗi lưu audio cache [${key}]:`, err);
+  }
+}
+
+/**
+ * Clears all cached audio chunks to reclaim storage space.
+ * @returns {Promise<boolean>}
+ */
+export async function clearAudioCache() {
+  try {
+    const database = await initDB();
+    if (database && database.audioCache) {
+      await database.audioCache.clear();
+      return true;
+    }
+    return false;
+  } catch (err) {
+    console.warn('Lỗi dọn sạch audio cache:', err);
+    return false;
+  }
+}
+
+/**
+ * Gets total count of cached audio chunks in IndexedDB.
+ * @returns {Promise<number>}
+ */
+export async function getAudioCacheCount() {
+  try {
+    const database = await initDB();
+    if (database && database.audioCache) {
+      return await database.audioCache.count();
+    }
+    return 0;
+  } catch (err) {
+    console.warn('Lỗi đếm audio cache:', err);
+    return 0;
+  }
+}
+
+/**
+ * Safely prunes oldest cached audio chunks if count exceeds maxEntries.
+ * Strictly touches only the audioCache store; never touches user data.
+ * @param {number} maxEntries
+ * @returns {Promise<number>} Number of evicted entries
+ */
+export async function pruneAudioCache(maxEntries = 500) {
+  try {
+    const database = await initDB();
+    if (!database || !database.audioCache || typeof database.audioCache.count !== 'function') return 0;
+    const count = await database.audioCache.count();
+    if (count > maxEntries) {
+      const deleteCount = count - maxEntries;
+      const oldestKeys = await database.audioCache.orderBy('createdAt').limit(deleteCount).keys();
+      if (oldestKeys.length > 0) {
+        await database.audioCache.bulkDelete(oldestKeys);
+        return oldestKeys.length;
+      }
+    }
+    return 0;
+  } catch (err) {
+    console.warn('Lỗi prune audio cache:', err);
+    return 0;
+  }
+}
+
+/**
+ * Saves specific per-book TTS settings (voice, engine, rate, pitch).
+ * @param {number} bookId
+ * @param {Object} ttsSettings
+ */
+export async function updateBookTtsSettings(bookId, ttsSettings) {
+  const database = await initDB();
+  return await database.books.update(Number(bookId), {
+    ttsSettings,
+    lastReadAt: Date.now()
+  });
+}
+
+// ============================================================================
+// CUSTOM DICTIONARY & TEXT REPLACEMENT RULES (IndexedDB: customRules store)
+// ============================================================================
+
+/**
+ * Retrieves custom dictionary rules. If bookId is provided, returns both
+ * global rules (bookId === null or 'global') and book-specific rules.
+ * @param {number|null} [bookId=null]
+ * @returns {Promise<Array<Object>>}
+ */
+export async function getCustomRules(bookId = null) {
+  const database = await initDB();
+  const all = await database.customRules.toArray();
+  if (bookId === null || bookId === undefined) {
+    return all;
+  }
+  const targetId = Number(bookId);
+  return all.filter(r => r.bookId === null || r.bookId === undefined || r.bookId === 'global' || Number(r.bookId) === targetId);
+}
+
+/**
+ * Adds a new custom dictionary replacement rule.
+ * @param {Object} rule - { bookId, findText, replaceText, isRegex, isCaseSensitive, isEnabled }
+ * @returns {Promise<number>} - Rule ID
+ */
+export async function addCustomRule(rule) {
+  const database = await initDB();
+  const record = {
+    bookId: rule.bookId !== undefined ? rule.bookId : null,
+    findText: rule.findText || '',
+    replaceText: rule.replaceText || '',
+    isRegex: !!rule.isRegex,
+    isCaseSensitive: !!rule.isCaseSensitive,
+    isEnabled: rule.isEnabled !== undefined ? !!rule.isEnabled : true,
+    createdAt: Date.now()
+  };
+  const id = await database.customRules.add(record);
+  notifyRulesChanged(record);
+  return id;
+}
+
+/**
+ * Updates an existing custom dictionary rule.
+ * @param {number} id
+ * @param {Object} updates
+ */
+export async function updateCustomRule(id, updates) {
+  const database = await initDB();
+  const previous = await database.customRules.get(Number(id));
+  const changed = await database.customRules.update(Number(id), updates);
+  if (changed && previous) notifyRulesChanged(previous, { ...previous, ...updates });
+  return changed;
+}
+
+/**
+ * Deletes a custom dictionary rule.
+ * @param {number} id
+ */
+export async function deleteCustomRule(id) {
+  const database = await initDB();
+  const previous = await database.customRules.get(Number(id));
+  const result = await database.customRules.delete(Number(id));
+  if (previous) notifyRulesChanged(previous);
+  return result;
+}
+
+/**
+ * Exports rules as JSON string or object.
+ * @param {number|null} [bookId=null]
+ * @returns {Promise<string>}
+ */
+export async function exportCustomRulesJSON(bookId = null) {
+  const rules = await getCustomRules(bookId);
+  return JSON.stringify({
+    version: 1,
+    appName: 'VietReader-Dictionary',
+    exportedAt: new Date().toISOString(),
+    rules
+  }, null, 2);
+}
+
+/**
+ * Imports rules from JSON array or object.
+ * @param {Array|Object} data
+ * @param {number|null} [targetBookId=null]
+ * @param {boolean} [replaceExisting=false]
+ */
+export async function importCustomRulesJSON(data, targetBookId = null, replaceExisting = false) {
+  const database = await initDB();
+  let rulesToImport = Array.isArray(data) ? data : (data.rules || []);
+
+  if (!Array.isArray(rulesToImport)) {
+    throw new Error('Định dạng dữ liệu quy tắc không hợp lệ.');
+  }
+
+  const result = await database.transaction('rw', database.customRules, async () => {
+    const changedRules = [];
+    if (replaceExisting) {
+      if (targetBookId !== null) {
+        const existing = await database.customRules.toArray();
+        const removed = existing.filter(r => Number(r.bookId) === Number(targetBookId));
+        const toDelete = removed.map(r => r.id);
+        await database.customRules.bulkDelete(toDelete);
+        changedRules.push(...removed);
+      } else {
+        changedRules.push(...await database.customRules.toArray());
+        await database.customRules.clear();
+      }
+    }
+
+    const cleaned = rulesToImport.map(r => ({
+      bookId: targetBookId !== null ? targetBookId : (r.bookId !== undefined ? r.bookId : null),
+      findText: r.findText || '',
+      replaceText: r.replaceText !== undefined ? r.replaceText : '',
+      isRegex: !!r.isRegex,
+      isCaseSensitive: !!r.isCaseSensitive,
+      isEnabled: r.isEnabled !== undefined ? !!r.isEnabled : true,
+      createdAt: r.createdAt || Date.now()
+    })).filter(r => r.findText.trim().length > 0);
+
+    if (cleaned.length > 0) {
+      await database.customRules.bulkAdd(cleaned);
+      changedRules.push(...cleaned);
+    }
+    return { count: cleaned.length, changedRules };
+  });
+  if (result.changedRules.length) notifyRulesChanged(...result.changedRules);
+  return result.count;
+}
+
+// ============================================================================
+// HIGHLIGHTS & QUOTES (IndexedDB: highlights store)
+// ============================================================================
+
+/**
+ * Retrieves all highlights for a specific chapter.
+ * @param {number} bookId
+ * @param {number} chapterIndex
+ * @returns {Promise<Array<Object>>}
+ */
+export async function getChapterHighlights(bookId, chapterIndex) {
+  const database = await initDB();
+  return await database.highlights
+    .where('[bookId+chapterIndex]')
+    .equals([Number(bookId), Number(chapterIndex)])
+    .toArray();
+}
+
+/**
+ * Retrieves all highlights for a whole book.
+ * @param {number} bookId
+ * @returns {Promise<Array<Object>>}
+ */
+export async function getBookHighlights(bookId) {
+  const database = await initDB();
+  return await database.highlights
+    .where('bookId')
+    .equals(Number(bookId))
+    .sortBy('createdAt');
+}
+
+/**
+ * Saves a new text highlight/quote note.
+ * @param {Object} item - { bookId, chapterIndex, paragraphIndex, selectedText, noteText, color }
+ * @returns {Promise<number>} - Highlight ID
+ */
+export async function addHighlight(item) {
+  const database = await initDB();
+  return await database.highlights.add({
+    bookId: Number(item.bookId),
+    chapterIndex: Number(item.chapterIndex),
+    paragraphIndex: Number(item.paragraphIndex || 0),
+    selectedText: (item.selectedText || '').trim(),
+    noteText: (item.noteText || '').trim(),
+    color: item.color || 'yellow',
+    createdAt: item.createdAt || Date.now()
+  });
+}
+
+/**
+ * Updates an existing highlight (e.g. updating noteText or color).
+ * @param {number} id
+ * @param {Object} updates
+ */
+export async function updateHighlight(id, updates) {
+  const database = await initDB();
+  return await database.highlights.update(Number(id), updates);
+}
+
+/**
+ * Deletes a highlight by ID.
+ * @param {number} id
+ */
+export async function deleteHighlight(id) {
+  const database = await initDB();
+  return await database.highlights.delete(Number(id));
+}

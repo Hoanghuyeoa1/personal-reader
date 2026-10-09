@@ -1,0 +1,46 @@
+diff --git a/diagnostics/phase3_before_storage.js.txt b/storage.js
+index 0734ce5..aa467a0 100644
+--- a/diagnostics/phase3_before_storage.js.txt
++++ b/storage.js
+@@ -4,6 +4,7 @@
+  */
+ 
+ let db = null;
++const pendingProgressWrites = new Map();
+ const searchIndexListeners = new Set();
+ const searchIndexSourceId = `search-${Math.random().toString(36).slice(2)}`;
+ let searchIndexChannel = null;
+@@ -316,15 +317,26 @@ export async function commitSearchIndexEntryIfCurrent(entry, validateSnapshot) {
+ /**
+  * Updates reading progress for a book.
+  */
+-export async function updateProgress(bookId, chapterIndex, scrollProgress = 0, scrollY = 0, currentChunkIndex = 0) {
+-  const database = await initDB();
+-  return await database.books.update(Number(bookId), {
++export async function updateProgress(bookId, chapterIndex, scrollProgress = 0, scrollY = 0, currentChunkIndex = 0, ttsChunkAnchor = null) {
++  const id = Number(bookId);
++  const token = {};
++  pendingProgressWrites.set(id, token);
++  const index = Number(currentChunkIndex);
++  const payload = {
+     currentChapterIndex: Number(chapterIndex),
+-    currentChunkIndex: Math.max(0, Number(currentChunkIndex)),
+-    scrollProgress: Math.min(100, Math.max(0, Math.round(scrollProgress))),
+-    scrollY: Math.max(0, Math.round(scrollY)),
++    currentChunkIndex: Number.isSafeInteger(index) && index >= 0 ? index : 0,
++    ttsChunkAnchor: ttsChunkAnchor?.chapterIndex === Number(chapterIndex) ? { ...ttsChunkAnchor } : null,
++    scrollProgress: Number.isFinite(Number(scrollProgress)) ? Math.min(100, Math.max(0, Math.round(Number(scrollProgress)))) : 0,
++    scrollY: Number.isFinite(Number(scrollY)) ? Math.max(0, Math.round(Number(scrollY))) : 0,
+     lastReadAt: Date.now()
+-  });
++  };
++  try {
++    const database = await initDB();
++    if (pendingProgressWrites.get(id) !== token) return 0;
++    return await database.books.update(id, payload);
++  } finally {
++    if (pendingProgressWrites.get(id) === token) pendingProgressWrites.delete(id);
++  }
+ }
+ 
+ /**

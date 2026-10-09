@@ -1,0 +1,165 @@
+diff --git a/diagnostics/phase4_before_ambientSound.js.txt b/ambientSound.js
+index f9226c5..6bd0acf 100644
+--- a/diagnostics/phase4_before_ambientSound.js.txt
++++ b/ambientSound.js
+@@ -55,6 +55,8 @@ export class AmbientSoundMixer {
+ 
+     // Cache pre-synthesized audio buffers
+     this.bufferCache = new Map();
++    this.pendingStops = new Map();
++    this.destroyed = false;
+ 
+     // Initialize preset states
+     AMBIENT_SOUND_PRESETS.forEach(preset => {
+@@ -74,9 +76,10 @@ export class AmbientSoundMixer {
+    * Initializes AudioContext and master gain node lazily on user gesture.
+    */
+   initAudioContext() {
++    if (this.destroyed) return null;
+     if (this.audioCtx) {
+       if (this.audioCtx.state === 'suspended') {
+-        this.audioCtx.resume();
++        Promise.resolve(this.audioCtx.resume()).catch(error => console.debug('Ambient resume failed:', error));
+       }
+       return this.audioCtx;
+     }
+@@ -103,6 +106,7 @@ export class AmbientSoundMixer {
+    * @returns {AudioBuffer|null}
+    */
+   getOrCreateBuffer(soundId) {
++    if (this.destroyed || !this.tracks.has(soundId)) return null;
+     if (this.bufferCache.has(soundId)) {
+       return this.bufferCache.get(soundId);
+     }
+@@ -299,6 +303,8 @@ export class AmbientSoundMixer {
+    * @param {string} soundId
+    */
+   startSound(soundId) {
++    if (this.destroyed) return;
++    this.finishPendingStop(soundId);
+     const track = this.tracks.get(soundId);
+     if (!track) return;
+ 
+@@ -318,7 +324,7 @@ export class AmbientSoundMixer {
+     sourceNode.loop = true;
+ 
+     const gainNode = ctx.createGain();
+-    const effectiveVol = track.volume * this.masterVolume * this.fadeFactor;
++    const effectiveVol = track.volume;
+     gainNode.gain.setValueAtTime(effectiveVol, ctx.currentTime);
+ 
+     sourceNode.connect(gainNode);
+@@ -335,42 +341,34 @@ export class AmbientSoundMixer {
+    * Stops playing a specific ambient sound with a smooth fade-out.
+    * @param {string} soundId
+    */
++  finishPendingStop(soundId) {
++    const pending = this.pendingStops.get(soundId);
++    if (!pending) return;
++    this.pendingStops.delete(soundId);
++    clearTimeout(pending.timer);
++    try { pending.source.stop(); } catch {}
++    try { pending.source.disconnect(); } catch {}
++    try { pending.source.buffer = null; } catch {}
++    try { pending.gain.disconnect(); } catch {}
++  }
++
+   stopSound(soundId) {
+     const track = this.tracks.get(soundId);
+     if (!track || !track.isPlaying) return;
+-
+-    const ctx = this.audioCtx;
+-    if (ctx && track.gainNode && track.sourceNode) {
+-      try {
+-        // Quick 40ms fade-out to prevent audio click
+-        track.gainNode.gain.setValueAtTime(track.gainNode.gain.value, ctx.currentTime);
+-        track.gainNode.gain.linearRampToValueAtTime(0.0001, ctx.currentTime + 0.04);
+-
+-        const nodeToStop = track.sourceNode;
+-        const gainToDisconnect = track.gainNode;
+-        setTimeout(() => {
+-          try {
+-            nodeToStop.stop();
+-            nodeToStop.disconnect();
+-          } catch (e) {}
+-          try {
+-            gainToDisconnect.disconnect();
+-          } catch (e) {}
+-        }, 50);
+-      } catch (err) {
+-        try {
+-          track.sourceNode.stop();
+-          track.sourceNode.disconnect();
+-        } catch (e) {}
+-        try {
+-          track.gainNode.disconnect();
+-        } catch (e) {}
+-      }
+-    }
+-
+-    track.sourceNode = null;
+-    track.gainNode = null;
++    this.finishPendingStop(soundId);
++    const source = track.sourceNode, gain = track.gainNode;
++    track.sourceNode = track.gainNode = null;
+     track.isPlaying = false;
++    if (!source || !gain) return;
++    const pending = { source, gain, timer: null };
++    this.pendingStops.set(soundId, pending);
++    try {
++      gain.gain.setValueAtTime(gain.gain.value, this.audioCtx.currentTime);
++      gain.gain.linearRampToValueAtTime(0.0001, this.audioCtx.currentTime + 0.04);
++      pending.timer = setTimeout(() => {
++        if (this.pendingStops.get(soundId) === pending) this.finishPendingStop(soundId);
++      }, 50);
++    } catch { this.finishPendingStop(soundId); }
+   }
+ 
+   /**
+@@ -404,7 +402,7 @@ export class AmbientSoundMixer {
+     track.volume = Math.max(0, Math.min(1, parseFloat(volume) || 0));
+ 
+     if (track.gainNode && this.audioCtx) {
+-      const effectiveVol = track.volume * this.masterVolume * this.fadeFactor;
++      const effectiveVol = track.volume;
+       track.gainNode.gain.setValueAtTime(effectiveVol, this.audioCtx.currentTime);
+     }
+   }
+@@ -435,7 +433,7 @@ export class AmbientSoundMixer {
+ 
+     this.tracks.forEach(track => {
+       if (track.gainNode && track.isPlaying) {
+-        const effectiveVol = track.volume * this.masterVolume * this.fadeFactor;
++        const effectiveVol = track.volume;
+         track.gainNode.gain.setValueAtTime(effectiveVol, this.audioCtx.currentTime);
+       }
+     });
+@@ -461,7 +459,7 @@ export class AmbientSoundMixer {
+    */
+   pauseAll() {
+     if (this.audioCtx && this.audioCtx.state === 'running') {
+-      this.audioCtx.suspend();
++      Promise.resolve(this.audioCtx.suspend()).catch(error => console.debug('Ambient suspend failed:', error));
+     }
+   }
+ 
+@@ -533,7 +531,10 @@ export class AmbientSoundMixer {
+    * Cleans up all ambient tracks, disconnects master nodes, and closes AudioContext.
+    */
+   destroy() {
++    if (this.destroyed) return;
++    this.destroyed = true;
+     this.stopAll();
++    for (const id of [...this.pendingStops.keys()]) this.finishPendingStop(id);
+     if (this.masterGain) {
+       try {
+         this.masterGain.disconnect();
+@@ -543,7 +544,7 @@ export class AmbientSoundMixer {
+     if (this.audioCtx) {
+       try {
+         if (typeof this.audioCtx.close === 'function') {
+-          this.audioCtx.close();
++          Promise.resolve(this.audioCtx.close()).catch(error => console.debug('Ambient close failed:', error));
+         }
+       } catch (e) {}
+       this.audioCtx = null;

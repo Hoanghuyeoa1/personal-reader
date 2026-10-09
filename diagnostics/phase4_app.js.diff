@@ -1,0 +1,110 @@
+diff --git a/diagnostics/phase4_before_app.js.txt b/app.js
+index 011c6f8..5cb5741 100644
+--- a/diagnostics/phase4_before_app.js.txt
++++ b/app.js
+@@ -661,11 +661,12 @@ function initTTSEngine() {
+     if (isPlaying && !isReaderChunkMapCurrent()) return;
+     actualTtsPlaybackActive = isPlaying;
+     const signal = isPlaying ? markReadingHistoryTtsStart : markReadingHistoryTtsPause;
+-    void signal(timestamp).catch(error => console.warn('Reading History TTS signal failed:', error));
++    void signal(timestamp, { bookId: state.currentBook?.id }).catch(error => console.warn('Reading History TTS signal failed:', error));
+   };
+   state.tts.onActualChunkStart = index => {
+     if (!isReaderChunkMapCurrent()) return;
+     if (isChapterSwitching) cancelChapterHandoff();
++    state.sleepTimer?.notifySentenceProgress(index, state.tts.chunks.length);
+     const chunk = logicalProgressMap?.chunks.get(Number(index));
+     if (!chunk) return;
+     const followsPrevious = lastCompletedProgressTtsChunkIndex !== null
+@@ -727,9 +728,7 @@ function initTTSEngine() {
+     if (DOM.miniFabBadge) {
+       DOM.miniFabBadge.textContent = `${percent}%`;
+     }
+-    if (state.sleepTimer) {
+-      state.sleepTimer.notifySentenceProgress(index, total);
+-    }
++
+ 
+     if (state.currentBook) {
+       state.currentBook.currentChunkIndex = index;
+@@ -769,11 +768,13 @@ function initTTSEngine() {
+         state.ambientMixer?.pauseAll();
+       } else if (status === 'stopped' || status === 'error') {
+         state.mediaSession.stopBackgroundSession();
++        state.ambientMixer?.pauseAll();
+       } else if (status === 'completed') {
+         state.mediaSession.stopBackgroundSession();
+-        state.sleepTimer?.notifyChapterEnd();
++        state.ambientMixer?.pauseAll();
+       }
+     }
++    if (status === 'completed') state.sleepTimer?.notifyChapterEnd();
+ 
+     // TỰ ĐỘNG CHUYỂN CHƯƠNG & ĐỌC TIẾP
+     if (status === 'completed') {
+@@ -4002,6 +4003,7 @@ async function handleSaveTtsSettings() {
+  * Initializes Hands-Free Auto-Scroll Engine.
+  */
+ function initAutoScrollEngine() {
++  state.autoScroll?.destroy();
+   state.autoScroll = new AutoScrollEngine({
+     speed: 40,
+     resumeDelay: 2000,
+@@ -4028,6 +4030,7 @@ function initAutoScrollEngine() {
+       }
+     },
+     onReachBottom: () => {
++      if (!isReaderChunkMapCurrent() || !DOM.readerView.classList.contains('active')) return;
+       // Nếu TTS đang phát hoặc đang trong tiến trình chuyển chương, nhường toàn quyền điều phối cho TTS
+       // để chống trùng lặp sự kiện chuyển chương (duplicate chapter transition) và lặp lịch sử đọc.
+       if (state.tts?.isPlaying || isChapterSwitching) {
+@@ -4049,12 +4052,16 @@ function initAutoScrollEngine() {
+         if (autoScrollNextTimer) {
+           clearTimeout(autoScrollNextTimer);
+         }
+-        autoScrollNextTimer = setTimeout(() => {
++        const mapping = readerChunkMap;
++        const navigation = readerNavigationGeneration;
++        const timer = setTimeout(() => {
++          if (autoScrollNextTimer !== timer || navigation !== readerNavigationGeneration || !isReaderChunkMapCurrent(mapping)) return;
+           autoScrollNextTimer = null;
+           if (!isChapterSwitching && (!state.tts || !state.tts.isPlaying)) {
+             navigateChapter(1, { activity: false });
+           }
+         }, 1500);
++        autoScrollNextTimer = timer;
+       } else {
+         showToast('Đã đọc đến cuối tác phẩm!', 'info');
+       }
+@@ -5139,9 +5146,9 @@ function initSleepTimer() {
+     },
+     onFade: (fadeRatio) => {
+       // Fade TTS volume from 1.0 to 0
+-      state.tts?.setVolume(fadeRatio);
++      state.tts?.setVolume((state.sleepTimer?.baseTtsVolume ?? 1) * fadeRatio);
+       // Fade ambient sound volume
+-      state.ambientMixer?.setFadeFactor(fadeRatio);
++      state.ambientMixer?.setFadeFactor((state.sleepTimer?.baseAmbientVolume ?? 1) * fadeRatio);
+     },
+     onExpire: ({ reason }) => {
+       handleSleepTimerExpire(reason);
+@@ -5180,7 +5187,8 @@ function initSleepTimer() {
+     btn.addEventListener('click', () => {
+       const minutes = parseInt(btn.getAttribute('data-minutes'), 10);
+       if (minutes && state.sleepTimer) {
+-        state.sleepTimer.start(minutes);
++        state.sleepTimer.start(minutes, state.sleepTimer.mode ? state.sleepTimer.baseTtsVolume : (state.tts?.volume ?? 1),
++          state.sleepTimer.mode ? state.sleepTimer.baseAmbientVolume : (state.ambientMixer?.fadeFactor ?? 1));
+         showToast(`Đã hẹn giờ tắt sau ${minutes} phút (kèm Fade-out 30s)`, 'success');
+         updatePresetButtonActive(minutes);
+         closeSleepTimerModal();
+@@ -5192,7 +5200,8 @@ function initSleepTimer() {
+   if (DOM.btnTimerChapterEnd) {
+     DOM.btnTimerChapterEnd.addEventListener('click', () => {
+       if (state.sleepTimer) {
+-        state.sleepTimer.setChapterEndMode();
++        state.sleepTimer.setChapterEndMode(state.sleepTimer.mode ? state.sleepTimer.baseTtsVolume : (state.tts?.volume ?? 1),
++          state.sleepTimer.mode ? state.sleepTimer.baseAmbientVolume : (state.ambientMixer?.fadeFactor ?? 1));
+         showToast('Đã bật: Tự động dừng sau khi đọc xong chương hiện tại', 'success');
+         updatePresetButtonActive('chapter_end');
+         closeSleepTimerModal();

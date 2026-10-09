@@ -1,0 +1,21 @@
+✔ setVoice: same effective value must not speak or cancel (4.2351ms)
+✔ setRate: same effective value must not speak or cancel (0.4968ms)
+✔ setPitch: same effective value must not speak or cancel (0.2122ms)
+✔ voiceschanged with recreated objects must preserve selection without restart (0.2775ms)
+✔ onstart then onerror must halt or retry same chunk, never skip six chunks (60.0863ms)
+✔ onend without onstart must not count actual completion (1.5658ms)
+✔ last-chunk error must not emit completed status (0.8766ms)
+✔ Pause -> Resume -> onend must advance the retained utterance (12.2952ms)
+✔ paused rate change must apply when resuming (1.3734ms)
+✔ stale captured onend must not clear the new utterance watchdog (291.4401ms)
+✔ duplicate captured terminal callbacks advance exactly once (15.5949ms)
+✔ watchdog halts without completion and cleans playback timers (34.417ms)
+✔ online voice classification and Stop timer cleanup (0.4523ms)
+ℹ tests 13
+ℹ suites 0
+ℹ pass 13
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 490.0249

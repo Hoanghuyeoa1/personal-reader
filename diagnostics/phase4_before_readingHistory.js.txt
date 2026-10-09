@@ -1,0 +1,1169 @@
+import {
+  getReadingSessions as readReadingSessions,
+  getUnfinishedReadingSessions,
+  putReadingSession,
+  deleteReadingSession as deleteStoredReadingSession,
+  clearReadingHistory as clearStoredReadingHistory
+} from './storage.js';
+
+export const READING_HISTORY_IDLE_MS = 60_000;
+export const READING_HISTORY_SESSION_SPLIT_MS = 30 * 60_000;
+export const READING_HISTORY_FLUSH_MS = 15_000;
+
+export const SESSION_EVENTS = Object.freeze({
+  SESSION_START: 'session_start',
+  READING: 'reading',
+  LISTENING: 'listening',
+  PAUSE: 'pause',
+  RESUME: 'resume',
+  CHAPTER_COMPLETE: 'chapter_complete',
+  SESSION_END: 'session_end'
+});
+
+export const SESSION_STATES = Object.freeze({
+  IDLE: 'idle',
+  READING: 'reading',
+  LISTENING: 'listening',
+  READING_AND_LISTENING: 'reading_and_listening',
+  PAUSED: 'paused',
+  ENDED: 'ended'
+});
+
+const MAX_TIMESTAMP = 8.64e15;
+
+function timestampValue(value, fallback = Date.now()) {
+  const number = Number(value ?? fallback);
+  return Number.isFinite(number) && Math.abs(number) <= MAX_TIMESTAMP ? Math.trunc(number) : Math.trunc(fallback);
+}
+
+function safeDuration(start, end) {
+  const duration = timestampValue(end, start) - timestampValue(start, start);
+  return Number.isFinite(duration) ? Math.max(0, duration) : 0;
+}
+
+function coveredLength(ranges) {
+  return ranges.reduce((sum, [start, end]) => sum + Math.max(0, end - start), 0);
+}
+
+function mergeProgressRange(ranges, start, end) {
+  if (!(end > start)) return { ranges, added: 0 };
+  const before = coveredLength(ranges);
+  const sorted = [...ranges, [start, end]].sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const range of sorted) {
+    const last = merged[merged.length - 1];
+    if (!last || range[0] > last[1]) merged.push([...range]);
+    else last[1] = Math.max(last[1], range[1]);
+  }
+  return { ranges: merged, added: Math.max(0, coveredLength(merged) - before) };
+}
+
+export function localDateKey(timestamp) {
+  const date = new Date(timestamp);
+  const year = String(date.getFullYear()).padStart(4, '0');
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+export function isLocalDateKey(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(year, month - 1, day);
+  return date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day;
+}
+
+export function asLocalDateKey(value) {
+  if (value instanceof Date) return Number.isFinite(value.getTime()) ? localDateKey(value.getTime()) : null;
+  if (typeof value === 'string') return isLocalDateKey(value) ? value : null;
+  if (typeof value === 'number' && Number.isFinite(value)) return localDateKey(value);
+  return null;
+}
+
+/** Shift an ISO-like local date key by calendar days, without 24-hour arithmetic. */
+export function shiftLocalDateKey(value, days) {
+  if (!isLocalDateKey(value) || !Number.isSafeInteger(days)) return null;
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(year, month - 1, day + days);
+  return `${String(date.getFullYear()).padStart(4, '0')}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+/** Inclusive local-calendar range. offsetDays moves the anchor by calendar days. */
+export function getLocalCalendarRange(period = 'today', now = Date.now(), offsetDays = 0) {
+  const today = new Date(timestampValue(now));
+  if (Number.isSafeInteger(offsetDays) && offsetDays !== 0) today.setDate(today.getDate() + offsetDays);
+  const last = `${String(today.getFullYear()).padStart(4, '0')}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+  const aliases = { '7days': 7, '7-days': 7, week: 7, '30days': 30, '30-days': 30, month: 30, today: 1 };
+  const normalizedPeriod = String(period).toLowerCase();
+  if (normalizedPeriod === 'alltime' || normalizedPeriod === 'all-time' || normalizedPeriod === 'all time') {
+    return { from: null, to: last };
+  }
+  const days = Number.isSafeInteger(period) ? period : aliases[normalizedPeriod];
+  if (!Number.isSafeInteger(days) || days < 1) return null;
+  const firstDate = new Date(today.getFullYear(), today.getMonth(), today.getDate() - days + 1);
+  const first = `${String(firstDate.getFullYear()).padStart(4, '0')}-${String(firstDate.getMonth() + 1).padStart(2, '0')}-${String(firstDate.getDate()).padStart(2, '0')}`;
+  return { from: first, to: last };
+}
+
+function emptyDailyStats(date) {
+  return { date, activeDurationMs: 0, ttsDurationMs: 0, wordsReadEstimate: 0, chaptersCompleted: 0, distinctBooks: 0 };
+}
+
+function historyDayLabel(date, todayKey) {
+  if (date === todayKey) return 'Hôm nay';
+  const today = new Date(`${todayKey}T12:00:00`);
+  const prior = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+  const yesterdayKey = `${String(prior.getFullYear()).padStart(4, '0')}-${String(prior.getMonth() + 1).padStart(2, '0')}-${String(prior.getDate()).padStart(2, '0')}`;
+  if (date === yesterdayKey) return 'Hôm qua';
+  const [year, month, day] = date.split('-');
+  return `${day}/${month}/${year}`;
+}
+
+function nextLocalMidnight(timestamp) {
+  const date = new Date(timestamp);
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate() + 1).getTime();
+}
+
+/** Allocate a duration across local calendar days without assuming 24-hour days. */
+function addDailyDuration(buckets, from, to, field) {
+  let cursor = from;
+  while (cursor < to) {
+    const boundary = nextLocalMidnight(cursor);
+    const end = Math.min(to, boundary > cursor ? boundary : to);
+    const key = localDateKey(cursor);
+    let bucket = buckets.find(item => item.date === key);
+    if (!bucket) {
+      bucket = { date: key, activeDurationMs: 0, ttsDurationMs: 0, wordsReadEstimate: 0, chaptersCompleted: 0 };
+      buckets.push(bucket);
+    }
+    bucket[field] += safeDuration(cursor, end);
+    cursor = end;
+  }
+}
+
+/** Allocate measured active intervals into local clock-hour buckets. */
+function addHourlyDuration(buckets, from, to, field) {
+  let cursor = from;
+  while (cursor < to) {
+    const date = new Date(cursor);
+    const boundary = new Date(date.getFullYear(), date.getMonth(), date.getDate(), date.getHours() + 1).getTime();
+    const end = Math.min(to, boundary > cursor ? boundary : to);
+    const dateKey = localDateKey(cursor);
+    const hour = date.getHours();
+    let bucket = buckets.find(item => item.date === dateKey);
+    if (!bucket) {
+      bucket = {
+        date: dateKey,
+        activeDurationMs: Array(24).fill(0),
+        ttsDurationMs: Array(24).fill(0)
+      };
+      buckets.push(bucket);
+    }
+    bucket[field][hour] += safeDuration(cursor, end);
+    cursor = end;
+  }
+}
+
+function makeSessionId() {
+  return globalThis.crypto?.randomUUID?.()
+    || `vr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+/**
+ * Core per-tab Reading Session accumulator. Activity/TTS/UI signals are
+ * forwarded by the app from its existing Reader/TTS/AutoScroll lifecycles.
+ */
+export class ReadingHistoryEngine {
+  constructor(options = {}) {
+    this.storage = options.storage || {
+      getReadingSessions: readReadingSessions,
+      getUnfinishedReadingSessions,
+      putReadingSession,
+      deleteReadingSession: deleteStoredReadingSession,
+      clearReadingHistory: clearStoredReadingHistory
+    };
+    this.now = options.now || (() => Date.now());
+    this.setInterval = options.setInterval || globalThis.setInterval?.bind(globalThis);
+    this.clearInterval = options.clearInterval || globalThis.clearInterval?.bind(globalThis);
+    this.flushIntervalMs = Math.max(1000, Number(options.flushIntervalMs) || READING_HISTORY_FLUSH_MS);
+    this.idleMs = Math.max(0, Number(options.idleMs ?? READING_HISTORY_IDLE_MS));
+    this.sessionSplitMs = Math.max(this.idleMs, Number(options.sessionSplitMs ?? READING_HISTORY_SESSION_SPLIT_MS));
+    this.session = null;
+    this.activeSegmentStart = null;
+    this.ttsSegmentStart = null;
+    this.lastAccountedAt = null;
+    this.lastActivityAt = null;
+    this.currentChapterIndex = null;
+    this.lastSessionContext = null;
+    this.chapterProgress = new Map();
+    this.ttsPlaying = false;
+    this.autoScrollRunning = false;
+    this.autoScrollPaused = false;
+    this.visible = options.visible !== false;
+    this.manuallyPaused = false;
+    this.pendingWrites = new Map();
+    this.flushTimer = null;
+    this.recoveryComplete = false;
+    this._isTransitioning = false;
+    this._persistedCheckpoints = new Map();
+    this._operation = Promise.resolve();
+  }
+
+  getSessionState(timestamp = this.now()) {
+    const time = this._time(timestamp);
+    if (!this.session) {
+      return {
+        status: SESSION_STATES.IDLE,
+        sessionId: null,
+        bookId: null,
+        chapterIndex: null,
+        activeDurationMs: 0,
+        ttsDurationMs: 0,
+        wordsReadEstimate: 0,
+        chaptersCompleted: 0,
+        completedChapterIndexes: [],
+        isPaused: false,
+        isTtsPlaying: false,
+        isVisible: Boolean(this.visible)
+      };
+    }
+    let status;
+    if (this.session.endedAt !== null) {
+      status = SESSION_STATES.ENDED;
+    } else if (this.manuallyPaused) {
+      status = SESSION_STATES.PAUSED;
+    } else {
+      const isReadingActive = Boolean(this.visible) && this.activeSegmentStart !== null && (this._hasContinuousActivity() || (this.lastActivityAt !== null && time < this.lastActivityAt + this.idleMs));
+      const isListeningActive = Boolean(this.ttsPlaying && this.ttsSegmentStart !== null);
+      if (isReadingActive && isListeningActive) {
+        status = SESSION_STATES.READING_AND_LISTENING;
+      } else if (isListeningActive) {
+        status = SESSION_STATES.LISTENING;
+      } else if (isReadingActive) {
+        status = SESSION_STATES.READING;
+      } else {
+        status = SESSION_STATES.IDLE;
+      }
+    }
+    return {
+      status,
+      sessionId: this.session.id,
+      bookId: this.session.bookId,
+      chapterIndex: this.currentChapterIndex,
+      activeDurationMs: Math.max(0, Math.floor(this.session.activeDurationMs)),
+      ttsDurationMs: Math.min(this.session.activeDurationMs, Math.max(0, Math.floor(this.session.ttsDurationMs))),
+      wordsReadEstimate: Number(this.session.wordsReadEstimate) || 0,
+      chaptersCompleted: Number(this.session.chaptersCompleted) || 0,
+      completedChapterIndexes: [...this.session.completedChapterIndexes],
+      isPaused: Boolean(this.manuallyPaused),
+      isTtsPlaying: Boolean(this.ttsPlaying),
+      isVisible: Boolean(this.visible)
+    };
+  }
+
+  async dispatchSessionEvent(eventType, payload = {}) {
+    if (this._isTransitioning) return false;
+    this._isTransitioning = true;
+    try {
+      const opts = payload && typeof payload === 'object' ? payload : {};
+      const timestamp = opts.timestamp !== undefined ? opts.timestamp : this.now();
+
+      // Guard stale session identity
+      if (this.session) {
+        if (opts.sessionId && opts.sessionId !== this.session.id) {
+          return false;
+        }
+        if (opts.bookId !== undefined && opts.bookId !== null
+          && eventType !== SESSION_EVENTS.SESSION_START
+          && Number(opts.bookId) !== Number(this.session.bookId)) {
+          return false;
+        }
+      }
+
+      switch (eventType) {
+        case SESSION_EVENTS.SESSION_START:
+          return await this.startSession({
+            bookId: opts.bookId,
+            chapterIndex: opts.chapterIndex,
+            timestamp
+          });
+
+        case SESSION_EVENTS.READING:
+          if (opts.position !== undefined && opts.totalWords !== undefined) {
+            return this.recordChapterProgress({
+              chapterIndex: opts.chapterIndex,
+              position: opts.position,
+              totalWords: opts.totalWords,
+              explicitJump: opts.explicitJump,
+              timestamp,
+              sessionId: opts.sessionId,
+              bookId: opts.bookId
+            });
+          }
+          return await this.markActivity({
+            chapterIndex: opts.chapterIndex,
+            timestamp,
+            sessionId: opts.sessionId,
+            bookId: opts.bookId
+          });
+
+        case SESSION_EVENTS.LISTENING: {
+          const state = String(opts.state || 'playing').toLowerCase();
+          if (state === 'start' || state === 'playing') {
+            const started = await this.markTtsStart(timestamp, { sessionId: opts.sessionId, bookId: opts.bookId });
+            if (opts.chapterIndex !== undefined && opts.position !== undefined && opts.totalWords !== undefined) {
+              this.recordChapterProgress({
+                chapterIndex: opts.chapterIndex,
+                position: opts.position,
+                totalWords: opts.totalWords,
+                explicitJump: opts.explicitJump,
+                timestamp,
+                sessionId: opts.sessionId,
+                bookId: opts.bookId
+              });
+            }
+            return started;
+          } else if (state === 'paused' || state === 'pause') {
+            return await this.markTtsPause(timestamp, { sessionId: opts.sessionId, bookId: opts.bookId });
+          } else if (state === 'stopped' || state === 'stop') {
+            return await this.markTtsStop(timestamp, { sessionId: opts.sessionId, bookId: opts.bookId });
+          } else if (state === 'error' || state === 'loading') {
+            return await this.markTtsPause(timestamp, { sessionId: opts.sessionId, bookId: opts.bookId });
+          }
+          return false;
+        }
+
+        case SESSION_EVENTS.PAUSE: {
+          const reason = opts.reason ? String(opts.reason).toLowerCase() : 'user';
+          if (reason === 'audio') {
+            return await this.markTtsPause(timestamp, { sessionId: opts.sessionId, bookId: opts.bookId });
+          } else if (reason === 'visibility') {
+            return await this.setVisibility(false, timestamp);
+          } else if (reason === 'autoscroll') {
+            return await this.setAutoScrollState({ isActive: this.autoScrollRunning, isPaused: true, timestamp });
+          }
+          return await this.pauseSession(timestamp, { sessionId: opts.sessionId, bookId: opts.bookId });
+        }
+
+        case SESSION_EVENTS.RESUME: {
+          const source = opts.source ? String(opts.source).toLowerCase() : 'user';
+          if (source === 'visibility') {
+            return await this.setVisibility(true, timestamp);
+          } else if (source === 'autoscroll') {
+            return await this.setAutoScrollState({ isActive: true, isPaused: false, timestamp });
+          }
+          return await this.resumeSession(timestamp, { sessionId: opts.sessionId, bookId: opts.bookId });
+        }
+
+        case SESSION_EVENTS.CHAPTER_COMPLETE:
+          return this.markChapterCompleted(opts.chapterIndex, timestamp, { sessionId: opts.sessionId, bookId: opts.bookId });
+
+        case SESSION_EVENTS.SESSION_END:
+          return await this.endSession(timestamp, { sessionId: opts.sessionId, bookId: opts.bookId });
+
+        default:
+          return false;
+      }
+    } finally {
+      this._isTransitioning = false;
+    }
+  }
+
+  _serialize(operation) {
+    const next = this._operation.then(operation, operation);
+    this._operation = next.catch(() => {});
+    return next;
+  }
+
+  _time(value) {
+    const normalized = timestampValue(value, timestampValue(this.now()));
+    return this.lastAccountedAt === null ? normalized : Math.max(this.lastAccountedAt, normalized);
+  }
+
+  _startFlushTimer() {
+    if (this.flushTimer !== null || typeof this.setInterval !== 'function') return;
+    this.flushTimer = this.setInterval(() => {
+      void this.flushSession().catch(error => this._logFailure('periodic flush', error));
+    }, this.flushIntervalMs);
+    if (typeof this.flushTimer?.unref === 'function') {
+      this.flushTimer.unref();
+    }
+  }
+
+  _stopFlushTimerIfIdle() {
+    if (this.session || this.pendingWrites.size || this.flushTimer === null) return;
+    this.clearInterval?.(this.flushTimer);
+    this.flushTimer = null;
+  }
+
+  _logFailure(operation, error) {
+    console.warn(`Reading History ${operation} failed; Reader remains available.`, error);
+  }
+
+  _hasContinuousActivity() {
+    return this.ttsPlaying || (this.visible && this.autoScrollRunning && !this.autoScrollPaused);
+  }
+
+  async setAutoScrollState({ isActive, isPaused = false, timestamp = this.now() } = {}) {
+    return this._serialize(async () => {
+      const time = this._time(timestamp);
+      if (!this.session && isActive && this.visible && this.lastSessionContext) {
+        await this._startInternal({ ...this.lastSessionContext, timestamp: time });
+      }
+      const wasContinuous = this._hasContinuousActivity();
+      if (this.session) this._advance(time);
+      this.autoScrollRunning = Boolean(isActive);
+      this.autoScrollPaused = Boolean(isPaused);
+      const continuous = this._hasContinuousActivity();
+      if (this.session && continuous && !wasContinuous) {
+        this.lastActivityAt = time;
+        this.manuallyPaused = false;
+        if (this.activeSegmentStart === null) this.activeSegmentStart = time;
+      } else if (this.session && wasContinuous && !continuous && !this.ttsPlaying) {
+        this.lastActivityAt = time;
+        this._advance(time);
+      }
+      if (this.session) await this._flushInternal(time);
+      return Boolean(this.session);
+    });
+  }
+
+  async setVisibility(visible, timestamp = this.now()) {
+    return this._serialize(async () => {
+      const time = this._time(timestamp);
+      const wasContinuous = this._hasContinuousActivity();
+      if (this.session) this._advance(time);
+      this.visible = Boolean(visible);
+      const continuous = this._hasContinuousActivity();
+      if (this.session && !this.visible && !this.ttsPlaying) this.activeSegmentStart = null;
+      if (this.session && wasContinuous && !continuous && !this.ttsPlaying) {
+        this.lastActivityAt = time;
+        this._advance(time);
+      } else if (this.session && !wasContinuous && continuous) {
+        this.lastActivityAt = time;
+        this.manuallyPaused = false;
+        if (this.activeSegmentStart === null) this.activeSegmentStart = time;
+      }
+      if (this.session) await this._flushInternal(time);
+      return Boolean(this.session);
+    });
+  }
+
+  async _writeSnapshot(snapshot) {
+    if (!snapshot || !snapshot.id) return false;
+    const previous = this._persistedCheckpoints.get(snapshot.id);
+    if (previous) {
+      if (previous.endedAt !== null && snapshot.endedAt === null) {
+        this.pendingWrites.delete(snapshot.id);
+        return false;
+      }
+      if (previous.safeCheckpointAt > snapshot.safeCheckpointAt && (previous.endedAt !== null || snapshot.endedAt === null)) {
+        this.pendingWrites.delete(snapshot.id);
+        return false;
+      }
+    }
+    try {
+      await this.storage.putReadingSession(snapshot);
+      this.pendingWrites.delete(snapshot.id);
+      this._persistedCheckpoints.set(snapshot.id, {
+        safeCheckpointAt: snapshot.safeCheckpointAt,
+        endedAt: snapshot.endedAt
+      });
+      if (this.session?.id === snapshot.id) this.session.safeCheckpointAt = snapshot.safeCheckpointAt;
+      return true;
+    } catch (error) {
+      this.pendingWrites.set(snapshot.id, snapshot);
+      this._logFailure('storage write', error);
+      return false;
+    }
+  }
+
+  _snapshot(checkpointAt, endedAt = null) {
+    return {
+      ...this.session,
+      endedAt,
+      endChapterIndex: this.currentChapterIndex ?? this.session.endChapterIndex ?? null,
+      activeDurationMs: Math.max(0, Math.floor(this.session.activeDurationMs)),
+      ttsDurationMs: Math.min(this.session.activeDurationMs, Math.max(0, Math.floor(this.session.ttsDurationMs))),
+      wordsReadEstimate: Number.isFinite(this.session.wordsReadEstimate)
+        ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(this.session.wordsReadEstimate)))
+        : 0,
+      safeCheckpointAt: checkpointAt,
+      lastActivityAt: this.lastActivityAt,
+      dailyBuckets: this.session.dailyBuckets.map(bucket => ({ ...bucket })),
+      hourlyBuckets: this.session.hourlyBuckets.map(bucket => ({
+        date: bucket.date,
+        activeDurationMs: [...bucket.activeDurationMs],
+        ttsDurationMs: [...bucket.ttsDurationMs]
+      }))
+    };
+  }
+
+  /** Advance and return a current in-memory snapshot without writing IndexedDB. */
+  async getSessionSnapshot(timestamp = this.now()) {
+    return this._serialize(() => {
+      if (!this.session) return null;
+      const time = this._time(timestamp);
+      this._advance(time);
+      return this._snapshot(time, this.session.endedAt ?? null);
+    });
+  }
+
+  _accrueField(from, to, field) {
+    if (to <= from) return;
+    const duration = safeDuration(from, to);
+    this.session[field] += duration;
+    addDailyDuration(this.session.dailyBuckets, from, to, field);
+    addHourlyDuration(this.session.hourlyBuckets, from, to, field);
+  }
+
+  /** Account elapsed time up to timestamp; idle grace caps reading-only activity. */
+  _advance(timestamp) {
+    if (!this.session) return timestamp;
+    const time = Math.max(this.lastAccountedAt ?? this.session.startedAt, timestamp);
+    const from = this.lastAccountedAt ?? time;
+    if (this.activeSegmentStart !== null) {
+      const readingDeadline = this.lastActivityAt === null ? from : this.lastActivityAt + this.idleMs;
+      const activeEnd = this._hasContinuousActivity() ? time : Math.min(time, Math.max(from, readingDeadline));
+      this._accrueField(from, activeEnd, 'activeDurationMs');
+    }
+    if (this.ttsSegmentStart !== null && this.ttsPlaying) {
+      this._accrueField(from, time, 'ttsDurationMs');
+    }
+    this.lastAccountedAt = time;
+
+    if (!this._hasContinuousActivity() && this.activeSegmentStart !== null
+      && this.lastActivityAt !== null && time >= this.lastActivityAt + this.idleMs) {
+      this.activeSegmentStart = null;
+    }
+    return time;
+  }
+
+  beginActiveSegment(timestamp = this.now()) {
+    if (!this.session) return false;
+    if (!this.visible && !this.ttsPlaying) return false;
+    const time = this._time(timestamp);
+    this._advance(time);
+    if (this.manuallyPaused) return false;
+    if (this.activeSegmentStart === null) this.activeSegmentStart = time;
+    return true;
+  }
+
+  closeActiveSegment(timestamp = this.now()) {
+    if (!this.session) return false;
+    this._advance(this._time(timestamp));
+    this.activeSegmentStart = null;
+    return true;
+  }
+
+  beginTtsSegment(timestamp = this.now()) {
+    if (!this.session) return false;
+    const time = this._time(timestamp);
+    this._advance(time);
+    if (this.ttsPlaying) return false;
+    this.ttsPlaying = true;
+    this.ttsSegmentStart = time;
+    this.lastActivityAt = time;
+    this.manuallyPaused = false;
+    if (this.activeSegmentStart === null) this.activeSegmentStart = time;
+    return true;
+  }
+
+  closeTtsSegment(timestamp = this.now()) {
+    if (!this.session || !this.ttsPlaying) return false;
+    this._advance(this._time(timestamp));
+    this.ttsPlaying = false;
+    this.ttsSegmentStart = null;
+    return true;
+  }
+
+  async recoverUnfinishedSessions(timestamp = this.now()) {
+    return this._serialize(async () => {
+      if (this.recoveryComplete) return 0;
+      this.recoveryComplete = true;
+      let unfinished;
+      try {
+        unfinished = await this.storage.getUnfinishedReadingSessions();
+      } catch (error) {
+        this.recoveryComplete = false;
+        this._logFailure('recovery read', error);
+        return 0;
+      }
+      let recovered = 0;
+      for (const row of unfinished || []) {
+        if (!row || typeof row !== 'object' || !row.id
+          || !Number.isSafeInteger(Number(row.bookId)) || Number(row.bookId) < 1
+          || !Number.isSafeInteger(Number(row.startedAt)) || Number(row.startedAt) < 0
+          || Number(row.startedAt) > MAX_TIMESTAMP) continue;
+        const startedAt = Number(row.startedAt);
+        const checkpoint = Math.max(startedAt, timestampValue(row.safeCheckpointAt, startedAt));
+        const activity = timestampValue(row.lastActivityAt, startedAt);
+        const endedAt = Math.max(startedAt, Math.min(checkpoint, activity + this.idleMs));
+        const snapshot = { ...row, endedAt, safeCheckpointAt: checkpoint };
+        if (await this._writeSnapshot(snapshot)) recovered++;
+      }
+      return recovered;
+    });
+  }
+
+  async startSession({ bookId, chapterIndex = null, timestamp = this.now() } = {}) {
+    await this.recoverUnfinishedSessions(timestamp);
+    return this._serialize(() => this._startInternal({ bookId, chapterIndex, timestamp }));
+  }
+
+  async _startInternal({ bookId, chapterIndex = null, timestamp = this.now() } = {}) {
+    const id = Number(bookId);
+    if (!Number.isSafeInteger(id) || id < 1) return null;
+    const time = this._time(timestamp);
+
+    if (this.session?.bookId === id) {
+      if (this.session.endedAt !== null) return this.session.id;
+      this.lastActivityAt = time;
+      this.manuallyPaused = false;
+      this.beginActiveSegment(time);
+      await this._flushInternal(time);
+      return this.session.id;
+    }
+    if (this.session) await this._endInternal(time);
+
+    this.currentChapterIndex = chapterIndex !== null && chapterIndex !== undefined
+      && Number.isSafeInteger(Number(chapterIndex)) && Number(chapterIndex) >= 0
+      ? Number(chapterIndex)
+      : null;
+    this.session = {
+      id: makeSessionId(),
+      bookId: id,
+      startedAt: time,
+      endedAt: null,
+      activeDurationMs: 0,
+      ttsDurationMs: 0,
+      startChapterIndex: this.currentChapterIndex,
+      endChapterIndex: this.currentChapterIndex,
+      wordsReadEstimate: 0,
+      chaptersCompleted: 0,
+      completedChapterIndexes: [],
+      safeCheckpointAt: time,
+      lastActivityAt: time,
+      dailyBuckets: [],
+      hourlyBuckets: []
+    };
+    this.lastSessionContext = { bookId: id, chapterIndex: this.currentChapterIndex };
+    this.chapterProgress = new Map();
+    this.lastActivityAt = time;
+    this.lastAccountedAt = time;
+    this.activeSegmentStart = this.visible ? time : null;
+    this.ttsSegmentStart = null;
+    this.ttsPlaying = false;
+    this.manuallyPaused = false;
+    this._startFlushTimer();
+    await this._flushInternal(time);
+    return this.session.id;
+  }
+
+  async markActivity({ timestamp = this.now(), chapterIndex, sessionId, bookId } = {}) {
+    return this._serialize(async () => {
+      if (this.session && sessionId && sessionId !== this.session.id) return false;
+      if (this.session && bookId !== undefined && Number(bookId) !== Number(this.session.bookId)) return false;
+      const time = this._time(timestamp);
+      if (!this.session) {
+        if (!this.visible || !this.lastSessionContext) return false;
+        await this._startInternal({ ...this.lastSessionContext, timestamp: time });
+      }
+      if (!this.session) return false;
+      if (!this.visible && !this.ttsPlaying) return false;
+      if (!this._hasContinuousActivity() && this.lastActivityAt !== null
+        && time - this.lastActivityAt >= this.sessionSplitMs) {
+        const currentBookId = this.session.bookId;
+        const previousChapter = this.currentChapterIndex;
+        const endAt = this.lastActivityAt + this.idleMs;
+        await this._endInternal(endAt, time);
+        return Boolean(await this._startInternal({ bookId: currentBookId, chapterIndex: chapterIndex ?? previousChapter, timestamp: time }));
+      }
+      this._advance(time);
+      this.lastActivityAt = time;
+      this.manuallyPaused = false;
+      if (chapterIndex !== undefined) this.markChapterEnter(chapterIndex, time);
+      this.beginActiveSegment(time);
+      return true;
+    });
+  }
+
+  async pauseSession(timestamp = this.now(), { sessionId, bookId } = {}) {
+    return this._serialize(async () => {
+      if (!this.session || this.session.endedAt !== null) return false;
+      if (sessionId && sessionId !== this.session.id) return false;
+      if (bookId !== undefined && Number(bookId) !== Number(this.session.bookId)) return false;
+      if (this.manuallyPaused && this.activeSegmentStart === null && this.ttsSegmentStart === null) return false;
+      const time = this._time(timestamp);
+      this._advance(time);
+      this.activeSegmentStart = null;
+      this.ttsSegmentStart = null;
+      this.ttsPlaying = false;
+      this.manuallyPaused = true;
+      await this._flushInternal(time);
+      return true;
+    });
+  }
+
+  async resumeSession(timestamp = this.now(), { sessionId, bookId } = {}) {
+    return this._serialize(async () => {
+      if (!this.session || this.session.endedAt !== null) return false;
+      if (sessionId && sessionId !== this.session.id) return false;
+      if (bookId !== undefined && Number(bookId) !== Number(this.session.bookId)) return false;
+      const time = this._time(timestamp);
+      if (this.lastActivityAt !== null && time - this.lastActivityAt >= this.sessionSplitMs) {
+        const currentBookId = this.session.bookId;
+        const chapterIndex = this.currentChapterIndex;
+        await this._endInternal(this.lastActivityAt + this.idleMs, time);
+        return Boolean(await this._startInternal({ bookId: currentBookId, chapterIndex, timestamp: time }));
+      }
+      this._advance(time);
+      this.manuallyPaused = false;
+      this.lastActivityAt = time;
+      this.activeSegmentStart = this.visible ? time : null;
+      return true;
+    });
+  }
+
+  markChapterLeave(chapterIndex = this.currentChapterIndex, timestamp = this.now()) {
+    if (!this.session) return false;
+    this._advance(this._time(timestamp));
+    if (chapterIndex !== null && chapterIndex !== undefined && Number.isSafeInteger(Number(chapterIndex)) && Number(chapterIndex) >= 0) {
+      this.currentChapterIndex = Number(chapterIndex);
+    }
+    this.session.endChapterIndex = this.currentChapterIndex;
+    void this.flushSession(timestamp);
+    return true;
+  }
+
+  markChapterEnter(chapterIndex, timestamp = this.now()) {
+    if (!this.session || !Number.isSafeInteger(Number(chapterIndex)) || Number(chapterIndex) < 0) return false;
+    this._advance(this._time(timestamp));
+    this.currentChapterIndex = Number(chapterIndex);
+    this.session.endChapterIndex = this.currentChapterIndex;
+    return true;
+  }
+
+  recordChapterProgress({ chapterIndex = this.currentChapterIndex, position, totalWords, explicitJump = false, timestamp = this.now(), sessionId, bookId } = {}) {
+    if (!this.session) return false;
+    if (sessionId && sessionId !== this.session.id) return false;
+    if (bookId !== undefined && Number(bookId) !== Number(this.session.bookId)) return false;
+    const index = Number(chapterIndex);
+    const words = Number(totalWords);
+    const offset = Number(position);
+    if (!Number.isSafeInteger(index) || index < 0 || !Number.isFinite(words) || words <= 0 || !Number.isFinite(offset)) return false;
+
+    const time = this._time(timestamp);
+    this._advance(time);
+    this.currentChapterIndex = index;
+    this.session.endChapterIndex = index;
+    const total = Math.min(Number.MAX_SAFE_INTEGER, Math.max(1, Math.floor(words)));
+    let progress = this.chapterProgress.get(index);
+    if (!progress) {
+      progress = {
+        totalWords: total,
+        lastPosition: null,
+        ranges: [],
+        accountedWords: 0,
+        segmentStart: null,
+        furthestSinceBaseline: null,
+        nearEndReached: false
+      };
+      this.chapterProgress.set(index, progress);
+    }
+    const logicalPosition = Math.min(progress.totalWords, Math.max(0, Math.floor(offset)));
+
+    let creditedWords = 0;
+    if (explicitJump) {
+      progress.lastPosition = logicalPosition;
+      progress.segmentStart = logicalPosition;
+      progress.furthestSinceBaseline = logicalPosition;
+      progress.nearEndReached = false;
+    } else if (progress.lastPosition === null) {
+      progress.lastPosition = logicalPosition;
+      progress.segmentStart = logicalPosition;
+      progress.furthestSinceBaseline = logicalPosition;
+    } else {
+      if (logicalPosition > progress.lastPosition) {
+        const merged = mergeProgressRange(progress.ranges, progress.lastPosition, logicalPosition);
+        progress.ranges = merged.ranges;
+        const coveredWords = coveredLength(progress.ranges);
+        creditedWords = Math.max(0, coveredWords - progress.accountedWords);
+        progress.accountedWords = Math.max(progress.accountedWords, coveredWords);
+        if (creditedWords > 0) {
+          this.session.wordsReadEstimate = Math.min(Number.MAX_SAFE_INTEGER, this.session.wordsReadEstimate + creditedWords);
+          const bucket = this._dailyBucket(time);
+          bucket.wordsReadEstimate = Math.min(Number.MAX_SAFE_INTEGER, bucket.wordsReadEstimate + creditedWords);
+          if (this.visible && !this.manuallyPaused) {
+            this.lastActivityAt = time;
+            if (this.activeSegmentStart === null) this.activeSegmentStart = time;
+          }
+        }
+        progress.furthestSinceBaseline = Math.max(progress.furthestSinceBaseline ?? logicalPosition, logicalPosition);
+        if (progress.furthestSinceBaseline / progress.totalWords >= 0.9
+          && (progress.furthestSinceBaseline - (progress.segmentStart ?? logicalPosition)) / progress.totalWords >= 0.02) {
+          progress.nearEndReached = true;
+        }
+      }
+      progress.lastPosition = logicalPosition;
+    }
+
+    return {
+      creditedWords,
+      progress: logicalPosition / progress.totalWords,
+      nearEndReached: progress.nearEndReached
+    };
+  }
+
+  isChapterNearEnd(chapterIndex = this.currentChapterIndex) {
+    return Boolean(this.chapterProgress.get(Number(chapterIndex))?.nearEndReached);
+  }
+
+  async markTtsStart(timestamp = this.now(), { sessionId, bookId } = {}) {
+    return this._serialize(async () => {
+      if (this.session && sessionId && sessionId !== this.session.id) return false;
+      if (this.session && bookId !== undefined && Number(bookId) !== Number(this.session.bookId)) return false;
+      const time = this._time(timestamp);
+      if (!this.session && this.lastSessionContext) {
+        await this._startInternal({ ...this.lastSessionContext, timestamp: time });
+      }
+      if (!this.session) return false;
+      if (this.lastActivityAt !== null && time - this.lastActivityAt >= this.sessionSplitMs && !this._hasContinuousActivity()) {
+        const currentBookId = this.session.bookId;
+        const chapterIndex = this.currentChapterIndex;
+        await this._endInternal(this.lastActivityAt + this.idleMs, time);
+        await this._startInternal({ bookId: currentBookId, chapterIndex, timestamp: time });
+      }
+      this.beginTtsSegment(time);
+      return true;
+    });
+  }
+
+  async markTtsPause(timestamp = this.now(), { sessionId, bookId } = {}) {
+    return this._serialize(async () => {
+      if (this.session && sessionId && sessionId !== this.session.id) return false;
+      if (this.session && bookId !== undefined && Number(bookId) !== Number(this.session.bookId)) return false;
+      const time = this._time(timestamp);
+      const closed = this.closeTtsSegment(time);
+      if (closed) {
+        this.lastActivityAt = time;
+        if (this.visible) {
+          this.manuallyPaused = false;
+          if (this.activeSegmentStart === null) this.activeSegmentStart = time;
+        } else this.activeSegmentStart = null;
+        await this._flushInternal(time);
+      }
+      return closed;
+    });
+  }
+
+  async markTtsStop(timestamp = this.now(), options) {
+    return this.markTtsPause(timestamp, options);
+  }
+
+  async flushSession(timestamp = this.now()) {
+    return this._serialize(() => this._flushInternal(this._time(timestamp)));
+  }
+
+  async _flushInternal(time) {
+    if (!this.session) {
+      await this._retryPendingWrites();
+      this._stopFlushTimerIfIdle();
+      return false;
+    }
+    this._advance(time);
+    if (!this._hasContinuousActivity() && this.lastActivityAt !== null
+      && time - this.lastActivityAt >= this.sessionSplitMs) {
+      await this._endInternal(this.lastActivityAt + this.idleMs, time);
+      await this._retryPendingWrites();
+      return true;
+    }
+    const snapshot = this._snapshot(time, this.session.endedAt ?? null);
+    const ok = await this._writeSnapshot(snapshot);
+    await this._retryPendingWrites();
+    this._stopFlushTimerIfIdle();
+    return ok;
+  }
+
+  async _retryPendingWrites() {
+    for (const snapshot of [...this.pendingWrites.values()]) {
+      await this._writeSnapshot(snapshot);
+    }
+  }
+
+  async endSession(timestamp = this.now(), { sessionId, bookId } = {}) {
+    return this._serialize(async () => {
+      if (this.session && sessionId && sessionId !== this.session.id) return false;
+      if (this.session && bookId !== undefined && Number(bookId) !== Number(this.session.bookId)) return false;
+      const ended = await this._endInternal(this._time(timestamp));
+      this.lastSessionContext = null;
+      return ended;
+    });
+  }
+
+  async _endInternal(time, checkpointAt = time) {
+    if (!this.session) return false;
+    this._advance(time);
+    const session = this.session;
+    this.lastSessionContext = { bookId: session.bookId, chapterIndex: this.currentChapterIndex ?? session.endChapterIndex ?? null };
+    const endAt = Math.max(session.startedAt, time);
+    const snapshot = this._snapshot(Math.max(endAt, timestampValue(checkpointAt, endAt)), endAt);
+    this.activeSegmentStart = null;
+    this.ttsSegmentStart = null;
+    this.ttsPlaying = false;
+    this.manuallyPaused = true;
+    this.session = null;
+    this.lastAccountedAt = null;
+    this.lastActivityAt = null;
+    this.currentChapterIndex = null;
+    this.autoScrollRunning = false;
+    this.autoScrollPaused = false;
+    await this._writeSnapshot(snapshot);
+    await this._retryPendingWrites();
+    this._stopFlushTimerIfIdle();
+    return true;
+  }
+
+  async recordWordsRead(words, timestamp = this.now(), { sessionId, bookId } = {}) {
+    if (!this.session) return false;
+    if (sessionId && sessionId !== this.session.id) return false;
+    if (bookId !== undefined && Number(bookId) !== Number(this.session.bookId)) return false;
+    const amount = Number(words);
+    if (!Number.isFinite(amount) || amount <= 0) return false;
+    this._advance(this._time(timestamp));
+    const estimate = Math.min(Number.MAX_SAFE_INTEGER, Math.floor(amount));
+    this.session.wordsReadEstimate = Math.min(Number.MAX_SAFE_INTEGER, this.session.wordsReadEstimate + estimate);
+    const bucket = this._dailyBucket(timestamp);
+    bucket.wordsReadEstimate = Math.min(Number.MAX_SAFE_INTEGER, bucket.wordsReadEstimate + estimate);
+    return true;
+  }
+
+  markChapterCompleted(chapterIndex = this.currentChapterIndex, timestamp = this.now(), { sessionId, bookId } = {}) {
+    if (!this.session) return false;
+    if (sessionId && sessionId !== this.session.id) return false;
+    if (bookId !== undefined && Number(bookId) !== Number(this.session.bookId)) return false;
+    this._advance(this._time(timestamp));
+    const index = Number(chapterIndex);
+    if (!Number.isSafeInteger(index) || index < 0 || this.session.completedChapterIndexes.includes(index)) return false;
+    this.session.completedChapterIndexes.push(index);
+    this.session.chaptersCompleted++;
+    this._dailyBucket(timestamp).chaptersCompleted++;
+    return true;
+  }
+
+  _dailyBucket(timestamp) {
+    const date = localDateKey(this._time(timestamp));
+    let bucket = this.session.dailyBuckets.find(item => item.date === date);
+    if (!bucket) {
+      bucket = { date, activeDurationMs: 0, ttsDurationMs: 0, wordsReadEstimate: 0, chaptersCompleted: 0 };
+      this.session.dailyBuckets.push(bucket);
+    }
+    return bucket;
+  }
+
+  async getHistory(options = {}) {
+    try {
+      const rows = await this.storage.getReadingSessions(options);
+      return (Array.isArray(rows) ? rows : []).sort((a, b) => Number(b.startedAt) - Number(a.startedAt));
+    }
+    catch (error) { this._logFailure('history query', error); return []; }
+  }
+
+  async _collectDailyData({ from, to, bookId } = {}) {
+    if (this.session) await this.flushSession();
+    const sessions = await this.getHistory({ bookId });
+    const totals = new Map();
+    const rangeBooks = new Set();
+    for (const session of sessions) for (const bucket of (Array.isArray(session?.dailyBuckets) ? session.dailyBuckets : [])) {
+      if (!bucket || !isLocalDateKey(bucket.date) || (from && bucket.date < from) || (to && bucket.date > to)) continue;
+      const book = Number(session.bookId);
+      if (!Number.isSafeInteger(book) || book < 1) continue;
+      const row = totals.get(bucket.date) || { ...emptyDailyStats(bucket.date), _bookIds: new Set() };
+      const active = Number(bucket.activeDurationMs);
+      const tts = Number(bucket.ttsDurationMs);
+      const words = Number(bucket.wordsReadEstimate);
+      const chapters = Number(bucket.chaptersCompleted);
+      const safeActive = Number.isFinite(active) ? Math.max(0, active) : 0;
+      row.activeDurationMs += safeActive;
+      row.ttsDurationMs += Number.isFinite(tts) ? Math.min(safeActive, Math.max(0, tts)) : 0;
+      row.wordsReadEstimate += Number.isFinite(words) ? Math.max(0, words) : 0;
+      row.chaptersCompleted += Number.isFinite(chapters) ? Math.max(0, chapters) : 0;
+      if (safeActive > 0) {
+        row._bookIds.add(book);
+        rangeBooks.add(book);
+      }
+      totals.set(bucket.date, row);
+    }
+    const rows = [...totals.values()].sort((a, b) => a.date.localeCompare(b.date));
+    for (const row of rows) {
+      row.ttsDurationMs = Math.min(row.activeDurationMs, row.ttsDurationMs);
+      row.distinctBooks = row._bookIds.size;
+      delete row._bookIds;
+    }
+    return { days: rows, bookIds: rangeBooks };
+  }
+
+  async _collectDailyStats(options) {
+    return (await this._collectDailyData(options)).days;
+  }
+
+  async getDailyStats(value = {}) {
+    const singleDate = typeof value === 'string' || value instanceof Date || typeof value === 'number';
+    const date = singleDate ? asLocalDateKey(value) : asLocalDateKey(value?.date);
+    if (singleDate || date) {
+      if (!date) return null;
+      const rows = await this._collectDailyStats({ from: date, to: date, bookId: value?.bookId });
+      return rows[0] || emptyDailyStats(date);
+    }
+    const from = asLocalDateKey(value?.from);
+    const to = asLocalDateKey(value?.to);
+    return this._collectDailyStats({ from, to, bookId: value?.bookId });
+  }
+
+  async getRangeStats(range = {}) {
+    let options = range || {};
+    if (typeof options === 'string' || Number.isSafeInteger(options)) options = { period: options };
+    const preset = options.period ?? options.days;
+    const calendar = preset === undefined ? null : getLocalCalendarRange(preset, options.now ?? this.now());
+    if (preset !== undefined && !calendar) {
+      return { activeDurationMs: 0, ttsDurationMs: 0, wordsReadEstimate: 0, chaptersCompleted: 0, distinctBooks: 0, daysWithActivity: 0 };
+    }
+    const from = calendar?.from ?? asLocalDateKey(options.from);
+    const to = calendar?.to ?? asLocalDateKey(options.to);
+    if ((options.from !== undefined && !from) || (options.to !== undefined && !to) || (from && to && from > to)) {
+      return { activeDurationMs: 0, ttsDurationMs: 0, wordsReadEstimate: 0, chaptersCompleted: 0, distinctBooks: 0, daysWithActivity: 0 };
+    }
+    const { days, bookIds } = await this._collectDailyData({ from, to, bookId: options.bookId });
+    const total = days.reduce((result, day) => {
+      result.activeDurationMs += day.activeDurationMs;
+      result.ttsDurationMs += day.ttsDurationMs;
+      result.wordsReadEstimate += day.wordsReadEstimate;
+      result.chaptersCompleted += day.chaptersCompleted;
+      result.distinctBooks += day.distinctBooks;
+      result.daysWithActivity += day.activeDurationMs > 0 ? 1 : 0;
+      return result;
+    }, { activeDurationMs: 0, ttsDurationMs: 0, wordsReadEstimate: 0, chaptersCompleted: 0, distinctBooks: 0, daysWithActivity: 0 });
+    // Count a book once across the requested range, even if read on many days.
+    total.distinctBooks = bookIds.size;
+    total.ttsDurationMs = Math.min(total.activeDurationMs, total.ttsDurationMs);
+    return total;
+  }
+
+  async getBookHistory(bookId, options = {}) {
+    const id = Number(bookId);
+    if (!Number.isSafeInteger(id) || id < 1) return [];
+    return this.getHistory({ ...options, bookId: id });
+  }
+
+  async getTimelineGroups(options = {}) {
+    const sessions = await this.getHistory({ bookId: options.bookId, limit: options.limit });
+    const todayKey = localDateKey(this.now());
+    const from = asLocalDateKey(options.from);
+    const to = asLocalDateKey(options.to);
+    const groups = new Map();
+    for (const session of sessions) {
+      const timestamp = Number(session?.startedAt);
+      if (!Number.isFinite(timestamp)) continue;
+      const buckets = Array.isArray(session.dailyBuckets) ? session.dailyBuckets : [];
+      const contributions = buckets.length ? buckets : [{ date: localDateKey(timestamp) }];
+      for (const contribution of contributions) {
+        const date = asLocalDateKey(contribution?.date);
+        if (!date || (from && date < from) || (to && date > to)) continue;
+        if (!groups.has(date)) groups.set(date, { date, label: historyDayLabel(date, todayKey), sessions: [] });
+        groups.get(date).sessions.push({ ...session, dayContribution: { ...contribution } });
+      }
+    }
+    return [...groups.values()].sort((a, b) => b.date.localeCompare(a.date)).map(group => ({
+      ...group,
+      sessions: group.sessions.sort((a, b) => Number(b.startedAt) - Number(a.startedAt))
+    }));
+  }
+
+  async deleteHistorySession(id) {
+    return this._serialize(async () => {
+      if (this.session?.id === id) this._discardActiveSession();
+      this.pendingWrites.delete(id);
+      this._persistedCheckpoints.delete(id);
+      try { return await this.storage.deleteReadingSession(id); }
+      catch (error) { this._logFailure('history delete', error); return false; }
+    });
+  }
+
+  async clearReadingHistory() {
+    return this._serialize(async () => {
+      this._discardActiveSession();
+      this.pendingWrites.clear();
+      this._persistedCheckpoints.clear();
+      try { return await this.storage.clearReadingHistory(); }
+      catch (error) { this._logFailure('history clear', error); return false; }
+    });
+  }
+
+  /** Drop an in-memory session after a replace restore has replaced stored history. */
+  async resetAfterRestore() {
+    return this._serialize(() => {
+      this._discardActiveSession();
+      this.pendingWrites.clear();
+      this._persistedCheckpoints.clear();
+      this.recoveryComplete = false;
+      return true;
+    });
+  }
+
+  _discardActiveSession() {
+    this.session = null;
+    this.activeSegmentStart = null;
+    this.ttsSegmentStart = null;
+    this.lastAccountedAt = null;
+    this.lastActivityAt = null;
+    this.currentChapterIndex = null;
+    this.lastSessionContext = null;
+    this.chapterProgress.clear();
+    this.ttsPlaying = false;
+    this.autoScrollRunning = false;
+    this.autoScrollPaused = false;
+    this.manuallyPaused = true;
+    if (this.flushTimer !== null) this.clearInterval?.(this.flushTimer);
+    this.flushTimer = null;
+  }
+
+  destroy() {
+    if (this.flushTimer !== null) this.clearInterval?.(this.flushTimer);
+    this.flushTimer = null;
+    this._persistedCheckpoints.clear();
+  }
+}
+
+export function createReadingHistory(options) {
+  return new ReadingHistoryEngine(options);
+}
+
+const readingHistory = createReadingHistory();
+export const startSession = options => readingHistory.startSession(options);
+export const pauseSession = timestamp => readingHistory.pauseSession(timestamp);
+export const resumeSession = timestamp => readingHistory.resumeSession(timestamp);
+export const endSession = timestamp => readingHistory.endSession(timestamp);
+export const markActivity = options => readingHistory.markActivity(options);
+export const markChapterEnter = (index, timestamp) => readingHistory.markChapterEnter(index, timestamp);
+export const markChapterLeave = (index, timestamp) => readingHistory.markChapterLeave(index, timestamp);
+export const markChapterCompleted = (index, timestamp) => readingHistory.markChapterCompleted(index, timestamp);
+export const recordChapterProgress = options => readingHistory.recordChapterProgress(options);
+export const isChapterNearEnd = index => readingHistory.isChapterNearEnd(index);
+export const markTtsStart = timestamp => readingHistory.markTtsStart(timestamp);
+export const markTtsPause = timestamp => readingHistory.markTtsPause(timestamp);
+export const markTtsStop = timestamp => readingHistory.markTtsStop(timestamp);
+export const setVisibility = (visible, timestamp) => readingHistory.setVisibility(visible, timestamp);
+export const setAutoScrollState = options => readingHistory.setAutoScrollState(options);
+export const flushSession = timestamp => readingHistory.flushSession(timestamp);
+export const getSessionSnapshot = timestamp => readingHistory.getSessionSnapshot(timestamp);
+export const getHistory = options => readingHistory.getHistory(options);
+export const getDailyStats = options => readingHistory.getDailyStats(options);
+export const getRangeStats = options => readingHistory.getRangeStats(options);
+export const getBookHistory = (bookId, options) => readingHistory.getBookHistory(bookId, options);
+export const getTimelineGroups = options => readingHistory.getTimelineGroups(options);
+export const deleteHistorySession = id => readingHistory.deleteHistorySession(id);
+export const clearReadingHistory = () => readingHistory.clearReadingHistory();
+export const resetAfterRestore = () => readingHistory.resetAfterRestore();
+export const dispatchSessionEvent = (event, payload) => readingHistory.dispatchSessionEvent(event, payload);
+export const getSessionState = timestamp => readingHistory.getSessionState(timestamp);
+

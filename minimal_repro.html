@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>Minimal SpeechSynthesis Isolation Diagnostic (Phase 3)</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 24px; line-height: 1.5; background: #0f172a; color: #f8fafc; max-width: 900px; margin: 0 auto; }
+    h2 { margin-top: 0; color: #38bdf8; }
+    .instructions { background: #1e293b; border-left: 4px solid #38bdf8; padding: 12px 16px; border-radius: 6px; margin-bottom: 20px; font-size: 14px; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; align-items: center; }
+    button { padding: 10px 16px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 13px; border: none; transition: opacity 0.2s; }
+    button:hover { opacity: 0.9; }
+    .btn-b { background: #10b981; color: #022c22; }
+    .btn-c { background: #f59e0b; color: #451a03; }
+    .btn-d { background: #8b5cf6; color: #2e1065; }
+    .btn-stop { background: #ef4444; color: #fff; }
+    select { padding: 9px 12px; border-radius: 6px; background: #1e293b; color: #f8fafc; border: 1px solid #475569; font-size: 13px; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 16px; }
+    .metric-card { background: #1e293b; padding: 10px; border-radius: 8px; border: 1px solid #334155; text-align: center; }
+    .metric-value { font-size: 20px; font-weight: bold; color: #38bdf8; }
+    .metric-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; margin-top: 2px; }
+    .status { padding: 10px 14px; border-radius: 6px; margin: 12px 0; background: #334155; font-weight: 500; font-size: 14px; }
+    pre { background: #020617; border: 1px solid #1e293b; padding: 12px; border-radius: 8px; overflow: auto; max-height: 280px; font-size: 12px; color: #cbd5e1; font-family: Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <h2>VietReader — Phase 3: Minimal SpeechSynthesis Isolation</h2>
+
+  <div class="instructions">
+    <strong>📋 Hướng dẫn đối chiếu Native RAM trên Edge:</strong><br>
+    1. Nhấn <code>Shift + Esc</code> trong Microsoft Edge để mở <strong>Edge Task Manager</strong>.<br>
+    2. Định vị 2 dòng chính: <strong>"Browser"</strong> (Edge Browser Process) và <strong>"Tab: Minimal SpeechSynthesis..."</strong>.<br>
+    3. Ghi nhận RAM Baseline trước khi bấm nút.<br>
+    4. Bấm chạy từng bài test, quan sát RAM trong lúc đọc và sau khi kết thúc 5 câu.<br>
+    5. <em>Điều kiện dừng khẩn cấp:</em> Bấm <strong>"Dừng & Cleanup"</strong> ngay lập tức nếu Browser Process RAM tăng liên tục &gt; 50 MB/s.
+  </div>
+
+  <div class="metrics">
+    <div class="metric-card"><div class="metric-value" id="count-chunk">0 / 5</div><div class="metric-label">Chunk Index</div></div>
+    <div class="metric-card"><div class="metric-value" id="count-speak">0</div><div class="metric-label">synth.speak()</div></div>
+    <div class="metric-card"><div class="metric-value" id="count-onstart">0</div><div class="metric-label">onstart</div></div>
+    <div class="metric-card"><div class="metric-value" id="count-onend">0</div><div class="metric-label">onend</div></div>
+    <div class="metric-card"><div class="metric-value" id="count-pulse">0</div><div class="metric-label">KeepAlive Pulse</div></div>
+  </div>
+
+  <div class="controls">
+    <label for="voice-select" style="font-size: 13px; font-weight: 600;">Giọng đọc:</label>
+    <select id="voice-select"></select>
+  </div>
+
+  <div class="controls">
+    <button class="btn-b" id="btn-test-b">TEST B: 5 câu Thuần túy (Không Keep-Alive)</button>
+    <button class="btn-c" id="btn-test-c">TEST C: 5 câu Kèm Keep-Alive Pulse (pause/resume)</button>
+    <button class="btn-d" id="btn-test-d">TEST D: 5 câu Kèm Silent Audio Loop</button>
+    <button class="btn-stop" id="btn-stop">Dừng & Cleanup</button>
+  </div>
+
+  <div class="status" id="status-box">Sẵn sàng thử nghiệm. Vui lòng chọn bài test.</div>
+
+  <h3>Nhật ký tiến trình chi tiết:</h3>
+  <pre id="log-output"></pre>
+
+  <script>
+    const statusBox = document.getElementById('status-box');
+    const logOutput = document.getElementById('log-output');
+    const voiceSelect = document.getElementById('voice-select');
+    const synth = window.speechSynthesis;
+
+    const countChunkEl = document.getElementById('count-chunk');
+    const countSpeakEl = document.getElementById('count-speak');
+    const countOnstartEl = document.getElementById('count-onstart');
+    const countOnendEl = document.getElementById('count-onend');
+    const countPulseEl = document.getElementById('count-pulse');
+
+    const sampleSentences = [
+      'Câu thứ nhất kiểm tra âm sắc và hàng đợi giọng nói.',
+      'Câu thứ hai kiểm tra quá trình chuyển câu an toàn.',
+      'Câu thứ ba đánh giá phản ứng của tiến trình trình duyệt.',
+      'Câu thứ tư kiểm tra bộ nhớ và sự kiện kết thúc.',
+      'Câu thứ năm hoàn tất bài kiểm tra cô lập thành công.'
+    ];
+
+    let isRunning = false;
+    let currentIndex = 0;
+    let keepAliveTimer = null;
+    let silentAudio = null;
+    let counts = { speak: 0, onstart: 0, onend: 0, pulse: 0 };
+
+    function updateMetrics() {
+      countChunkEl.textContent = `${currentIndex} / ${sampleSentences.length}`;
+      countSpeakEl.textContent = counts.speak;
+      countOnstartEl.textContent = counts.onstart;
+      countOnendEl.textContent = counts.onend;
+      countPulseEl.textContent = counts.pulse;
+    }
+
+    function log(msg) {
+      const time = new Date().toISOString().substring(11, 23);
+      logOutput.textContent += `[${time}] ${msg}\n`;
+      logOutput.scrollTop = logOutput.scrollHeight;
+    }
+
+    function populateVoices() {
+      if (!synth) return;
+      const voices = synth.getVoices();
+      voiceSelect.innerHTML = '';
+      if (voices.length === 0) {
+        const opt = document.createElement('option');
+        opt.textContent = 'Đang tải danh sách giọng...';
+        voiceSelect.appendChild(opt);
+        return;
+      }
+
+      voices.forEach((v, i) => {
+        const opt = document.createElement('option');
+        opt.value = i;
+        opt.textContent = `${v.name} (${v.lang})`;
+        if (/hoaimy/i.test(v.name)) {
+          opt.selected = true;
+        }
+        voiceSelect.appendChild(opt);
+      });
+      if (!voiceSelect.value && voices.length > 0) voiceSelect.selectedIndex = 0;
+    }
+
+    populateVoices();
+    if (synth && synth.onvoiceschanged !== undefined) {
+      synth.onvoiceschanged = populateVoices;
+    }
+
+    function stopAll() {
+      isRunning = false;
+      if (keepAliveTimer) {
+        clearInterval(keepAliveTimer);
+        keepAliveTimer = null;
+        log('Đã dừng Keep-Alive timer.');
+      }
+      if (silentAudio) {
+        try { silentAudio.pause(); silentAudio.src = ''; } catch(e) {}
+        silentAudio = null;
+        log('Đã dừng Silent Audio.');
+      }
+      if (synth) {
+        synth.cancel();
+        if (synth.paused) synth.resume();
+        log('Đã gọi synth.cancel() và synth.resume().');
+      }
+      statusBox.textContent = 'Đã dừng và dọn dẹp tài nguyên.';
+      updateMetrics();
+    }
+
+    document.getElementById('btn-stop').addEventListener('click', stopAll);
+
+    async function runIsolatedSequence(options = {}) {
+      if (isRunning) stopAll();
+      isRunning = true;
+      currentIndex = 0;
+      counts = { speak: 0, onstart: 0, onend: 0, pulse: 0 };
+      updateMetrics();
+      logOutput.textContent = '';
+
+      const { useKeepAlive = false, useSilentAudio = false } = options;
+      const voices = synth.getVoices();
+      const selectedVoice = voices[parseInt(voiceSelect.value, 10)] || voices[0];
+      const voiceName = selectedVoice ? selectedVoice.name : 'Mặc định';
+
+      log(`=== BẮT ĐẦU THỬ NGHIỆM ===`);
+      log(`Giọng đọc: ${voiceName}`);
+      log(`Cấu hình: Keep-Alive=${useKeepAlive}, SilentAudio=${useSilentAudio}`);
+      statusBox.textContent = `Đang phát câu 1/${sampleSentences.length} [${voiceName}]...`;
+
+      if (useSilentAudio) {
+        silentAudio = new Audio('data:audio/wav;base64,UklGRjIAAABXQVZFZm10IBIAAAABAAEAQB8AAEAfAAABAAgAAABmYWN0BAAAAAAAAABkYXRhAAAAAA==');
+        silentAudio.loop = true;
+        silentAudio.volume = 0.001;
+        silentAudio.play().catch(e => log('Silent audio play error: ' + e.message));
+        log('Silent Audio loop đã khởi chạy.');
+      }
+
+      if (useKeepAlive) {
+        keepAliveTimer = setInterval(() => {
+          if (isRunning && synth.speaking && !synth.paused) {
+            counts.pulse++;
+            updateMetrics();
+            log('Keep-Alive pulse: synth.pause() -> synth.resume()');
+            try {
+              synth.pause();
+              synth.resume();
+            } catch (e) {
+              log('Keep-Alive error: ' + e.message);
+            }
+          }
+        }, 3000); // Pulse mỗi 3s trong môi trường test cô lập để quan sát phản ứng tức thời
+        log('Keep-Alive timer đã kích hoạt (chu kỳ 3s).');
+      }
+
+      function speakNext() {
+        if (!isRunning || currentIndex >= sampleSentences.length) {
+          log('=== HOÀN THÀNH TẤT CẢ 5 CÂU ===');
+          stopAll();
+          statusBox.textContent = 'Hoàn tất thử nghiệm. Kiểm tra RAM Edge Task Manager.';
+          return;
+        }
+
+        const idx = currentIndex++;
+        updateMetrics();
+        const text = sampleSentences[idx];
+        log(`[Bắt đầu câu ${idx + 1}/5]: "${text.substring(0, 30)}..."`);
+        statusBox.textContent = `Đang phát câu ${idx + 1}/${sampleSentences.length}...`;
+
+        const utt = new SpeechSynthesisUtterance(text);
+        if (selectedVoice) utt.voice = selectedVoice;
+        utt.rate = 1.0;
+
+        let handled = false;
+        utt.onstart = () => {
+          counts.onstart++;
+          updateMetrics();
+          log(`  -> onstart câu ${idx + 1}`);
+        };
+
+        utt.onend = () => {
+          if (handled) return;
+          handled = true;
+          counts.onend++;
+          updateMetrics();
+          log(`  -> onend câu ${idx + 1} (thành công)`);
+          utt.onend = null;
+          utt.onerror = null;
+          utt.onstart = null;
+          // Khoảng đệm an toàn 150ms để Edge Media Foundation flush native buffer
+          setTimeout(speakNext, 150);
+        };
+
+        utt.onerror = (e) => {
+          if (handled) return;
+          handled = true;
+          log(`  -> onerror câu ${idx + 1}: ${e.error}`);
+          utt.onend = null;
+          utt.onerror = null;
+          utt.onstart = null;
+          setTimeout(speakNext, 150);
+        };
+
+        counts.speak++;
+        updateMetrics();
+        synth.speak(utt);
+      }
+
+      speakNext();
+    }
+
+    document.getElementById('btn-test-b').addEventListener('click', () => {
+      runIsolatedSequence({ useKeepAlive: false, useSilentAudio: false });
+    });
+
+    document.getElementById('btn-test-c').addEventListener('click', () => {
+      runIsolatedSequence({ useKeepAlive: true, useSilentAudio: false });
+    });
+
+    document.getElementById('btn-test-d').addEventListener('click', () => {
+      runIsolatedSequence({ useKeepAlive: false, useSilentAudio: true });
+    });
+  </script>
+</body>
+</html>

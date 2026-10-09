@@ -1,0 +1,161 @@
+diff --git a/diagnostics/phase4_before_autoscroll.js.txt b/autoscroll.js
+index 9fa6db9..2fa6706 100644
+--- a/diagnostics/phase4_before_autoscroll.js.txt
++++ b/autoscroll.js
+@@ -32,6 +32,8 @@ export class AutoScrollEngine {
+     this._loop = this._loop.bind(this);
+ 
+     this.dockEl = null;
++    this.generation = 0;
++    this.destroyed = false;
+   }
+ 
+   /**
+@@ -39,7 +41,12 @@ export class AutoScrollEngine {
+    * @param {HTMLElement} [dockEl]
+    */
+   bindListeners(dockEl = null) {
+-    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
++    if (this.destroyed || typeof window === 'undefined' || typeof window.addEventListener !== 'function') return;
++    if (this.dockEl) {
++      this.dockEl.removeEventListener?.('mouseenter', this._handleDockEnter);
++      this.dockEl.removeEventListener?.('mouseleave', this._handleDockLeave);
++    }
++    this.dockEl = null;
+ 
+     window.addEventListener('wheel', this._handleWheel, { passive: true });
+     window.addEventListener('touchstart', this._handleTouch, { passive: true });
+@@ -56,6 +63,8 @@ export class AutoScrollEngine {
+    * Cleans up all attached listeners and stops animation.
+    */
+   destroy() {
++    if (this.destroyed) return;
++    this.destroyed = true;
+     this.stop();
+     if (typeof window === 'undefined' || typeof window.removeEventListener !== 'function') return;
+ 
+@@ -67,26 +76,30 @@ export class AutoScrollEngine {
+       this.dockEl.removeEventListener('mouseenter', this._handleDockEnter);
+       this.dockEl.removeEventListener('mouseleave', this._handleDockLeave);
+     }
++    this.dockEl = null;
++    this.onStateChange = this.onReachBottom = null;
+   }
+ 
+   /**
+    * Starts hands-free continuous auto-scrolling.
+    */
+   start() {
+-    if (this.isActive) return;
++    if (this.destroyed || this.isActive) return;
++    const generation = ++this.generation;
+     this.isActive = true;
+     this.isPaused = false;
+     this.lastTimestamp = null;
+ 
+     this._notifyState();
+-    this.rafId = window.requestAnimationFrame(this._loop);
++    if (this.isActive && generation === this.generation) this._scheduleFrame();
+   }
+ 
+   /**
+    * Stops auto-scrolling completely.
+    */
+   stop() {
+-    if (!this.isActive && !this.isPaused) return;
++    const wasActive = this.isActive || this.isPaused;
++    this.generation++;
+ 
+     this.isActive = false;
+     this.isPaused = false;
+@@ -99,7 +112,7 @@ export class AutoScrollEngine {
+       this.resumeTimeout = null;
+     }
+     this.lastTimestamp = null;
+-    this._notifyState();
++    if (wasActive) this._notifyState();
+   }
+ 
+   /**
+@@ -150,20 +163,25 @@ export class AutoScrollEngine {
+   pauseTemporary(delayMs = 2000) {
+     if (!this.isActive) return;
+ 
++    const generation = this.generation;
+     this.isPaused = true;
+     this._notifyState();
++    if (!this.isActive || generation !== this.generation) return;
+ 
+     if (this.resumeTimeout) {
+       clearTimeout(this.resumeTimeout);
+     }
+ 
+-    this.resumeTimeout = setTimeout(() => {
++    const timer = setTimeout(() => {
++      if (this.resumeTimeout !== timer || generation !== this.generation) return;
++      this.resumeTimeout = null;
+       if (this.isActive) {
+         this.isPaused = false;
+         this.lastTimestamp = null; // Prevent huge delta jump after pause
+         this._notifyState();
+       }
+     }, delayMs);
++    this.resumeTimeout = timer;
+   }
+ 
+   /**
+@@ -182,6 +200,7 @@ export class AutoScrollEngine {
+     if (this.isActive) {
+       this.isPaused = true;
+       if (this.resumeTimeout) clearTimeout(this.resumeTimeout);
++      this.resumeTimeout = null;
+       this._notifyState();
+     }
+   }
+@@ -198,8 +217,18 @@ export class AutoScrollEngine {
+   /**
+    * Main requestAnimationFrame scroll loop.
+    */
+-  _loop(timestamp) {
+-    if (!this.isActive) return;
++  _scheduleFrame() {
++    const generation = this.generation;
++    const frame = window.requestAnimationFrame(timestamp => {
++      if (this.rafId !== frame || generation !== this.generation || this.destroyed) return;
++      this.rafId = null;
++      this._loop(timestamp, generation);
++    });
++    this.rafId = frame;
++  }
++
++  _loop(timestamp, generation = this.generation) {
++    if (!this.isActive || generation !== this.generation || this.destroyed) return;
+ 
+     if (!this.isPaused) {
+       if (this.lastTimestamp !== null) {
+@@ -210,6 +239,7 @@ export class AutoScrollEngine {
+ 
+         if (distance > 0) {
+           window.scrollBy(0, distance);
++          if (!this.isActive || generation !== this.generation) return;
+ 
+           // Check if reached bottom of the document
+           const scrollPos = window.innerHeight + window.scrollY;
+@@ -218,7 +248,7 @@ export class AutoScrollEngine {
+           if (scrollPos >= maxScroll - 6) {
+             // Reached bottom
+             this.stop();
+-            if (this.onReachBottom) {
++            if (!this.isActive && this.generation === generation + 1 && this.onReachBottom) {
+               this.onReachBottom();
+             }
+             return;
+@@ -228,7 +258,7 @@ export class AutoScrollEngine {
+       this.lastTimestamp = timestamp;
+     }
+ 
+-    this.rafId = window.requestAnimationFrame(this._loop);
++    if (this.isActive && generation === this.generation) this._scheduleFrame();
+   }
+ 
+   /**

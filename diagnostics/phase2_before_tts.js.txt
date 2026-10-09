@@ -1,0 +1,1698 @@
+/**
+ * Multi-Engine Text-to-Speech (TTS) System for Personal Reader (VietReader)
+ * Supports Tier 1 (Optimized Web Speech API with Neural Voice detection and Pitch control)
+ * and Tier 2 (Cloud AI TTS BYOK with FPT AI, OpenAI, IndexedDB Audio Caching & Graceful Fallback).
+ */
+
+import { getCachedAudio, setCachedAudio } from './storage.js';
+import {
+  TTSQueueScheduler,
+  QUEUE_ENTRY_STATES,
+  makeConfigFingerprint,
+  buildCacheKey,
+  buildLegacyCacheKey,
+  hashText
+} from './ttsQueueScheduler.js';
+import {
+  fetchCloudAudio as executeFetchCloudAudio,
+  downloadAudioWithRetry as executeDownloadAudioWithRetry,
+  CloudTtsError
+} from './cloudTtsProvider.js';
+
+export const VIETNAMESE_VOICE_CATALOG = {
+  // Pre-configured Cloud AI voices
+  cloud: [
+    { id: 'fpt:banmai', provider: 'fpt', voice: 'banmai', name: '🌸 Ban Mai (Nữ - Bắc, Truyền cảm)', gender: 'female', region: 'Bắc' },
+    { id: 'fpt:minhquang', provider: 'fpt', voice: 'minhquang', name: '👨 Minh Quang (Nam - Bắc, Trầm ấm)', gender: 'male', region: 'Bắc' },
+    { id: 'fpt:thudung', provider: 'fpt', voice: 'thudung', name: '🌾 Thu Dung (Nữ - Trung, Dịu dàng)', gender: 'female', region: 'Trung' },
+    { id: 'fpt:lannhi', provider: 'fpt', voice: 'lannhi', name: '🌊 Lan Nhi (Nữ - Nam, Ngọt ngào)', gender: 'female', region: 'Nam' },
+    { id: 'fpt:leminh', provider: 'fpt', voice: 'leminh', name: '🎙️ Lê Minh (Nam - Bắc, Phát thanh)', gender: 'male', region: 'Bắc' },
+    { id: 'fpt:myan', provider: 'fpt', voice: 'myan', name: '🌺 Mỹ An (Nữ - Nam, Tươi trẻ)', gender: 'female', region: 'Nam' },
+    { id: 'openai:nova', provider: 'openai', voice: 'nova', name: '✨ Nova (OpenAI AI - Nữ truyền cảm)', gender: 'female', region: 'Toàn cầu' },
+    { id: 'openai:shimmer', provider: 'openai', voice: 'shimmer', name: '🌸 Shimmer (OpenAI AI - Nữ êm dịu)', gender: 'female', region: 'Toàn cầu' },
+    { id: 'openai:onyx', provider: 'openai', voice: 'onyx', name: '🎙️ Onyx (OpenAI AI - Nam trầm ấm)', gender: 'male', region: 'Toàn cầu' },
+    { id: 'openai:alloy', provider: 'openai', voice: 'alloy', name: '🎧 Alloy (OpenAI AI - Giọng cân bằng)', gender: 'neutral', region: 'Toàn cầu' },
+    { id: 'openai:fable', provider: 'openai', voice: 'fable', name: '📖 Fable (OpenAI AI - Kể chuyện truyền cảm)', gender: 'neutral', region: 'Toàn cầu' }
+  ]
+};
+
+/**
+ * Returns a human-friendly decorated name for a browser Web Speech voice.
+ */
+export function formatBrowserVoiceLabel(voice) {
+  const name = voice.name || '';
+  if (/hoaimy/i.test(name)) {
+    return '👩 Hoài My (Nữ - Bắc, Tự nhiên - Edge Natural)';
+  }
+  if (/namminh|microsoft nam/i.test(name)) {
+    return '👨 Nam (Nam - Bắc, Trầm ấm - Edge Natural)';
+  }
+  if (/google\s*ti[ếe]ng\s*vi[ệe]t/i.test(name)) {
+    return '👩 Google Tiếng Việt (Nữ chuẩn - Chrome/Android)';
+  }
+  if (/microsoft an/i.test(name)) {
+    return '👩 An (Nữ - Tự nhiên - Windows)';
+  }
+  if (/microsoft mai/i.test(name)) {
+    return '👩 Mai (Nữ - Tiếng Việt - Windows)';
+  }
+  if (/linh/i.test(name)) {
+    return '👩 Linh (Nữ - Tiếng Việt - Apple)';
+  }
+  // Generic fallback format
+  return `🇻🇳 ${name}`;
+}
+
+/**
+ * Generates a simple hash string for text caching.
+ */
+function hashString(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+export class TTSEngine {
+  constructor() {
+    this.synth = typeof window !== 'undefined' && window.speechSynthesis ? window.speechSynthesis : null;
+    this.audioElement = null;
+    if (typeof Audio !== 'undefined') {
+      this.audioElement = new Audio();
+    } else if (typeof window !== 'undefined' && window.Audio) {
+      this.audioElement = new window.Audio();
+    }
+
+    // Engine mode: 'browser' | 'cloud'
+    this.engine = 'browser';
+
+    // Cloud BYOK configurations
+    this.cloudConfig = {
+      provider: 'fpt',          // 'fpt' | 'openai'
+      apiKey: '',
+      endpoint: '',            // custom endpoint if any
+      voice: 'banmai',
+      model: 'tts-1',
+      speed: 0
+    };
+
+    // Browser voices & settings
+    this.voices = [];
+    this.selectedVoice = null;
+    this.rate = 1.0;           // 0.7 to 2.2
+    this.pitch = 1.0;          // 0.5 to 1.5
+    this.volume = 1.0;         // 0.0 to 1.0 (Fade-out & Volume Control)
+
+    // Audio stream URL cache tracker for clean disposal
+    this.currentAudioUrl = null;
+    this.currentUtterance = null;
+    this.previewAudio = null;
+    this.previewAudioUrl = null;
+    this.previewUtterance = null;
+    this.previewRequestId = 0;
+
+    // Playback state
+    this.chunks = [];
+    this.currentIndex = 0;
+    this.isPlaying = false;
+    this.isPaused = false;
+    this.autoScrollEnabled = true;
+
+    // Chrome idle bug workaround timer
+    this.keepAliveTimer = null;
+
+    // Callbacks
+    this.onChunkStart = null;       // (index, text, total) => {}
+    this.onChunkEnd = null;         // (index) => {}
+    this.onStatusChange = null;     // (status: 'idle' | 'playing' | 'paused' | 'stopped' | 'completed') => {}
+    this.onPlaybackStateChange = null; // (isActuallyPlaying, timestamp) => {}
+    this.onActualChunkStart = null;     // (index, timestamp) => {}
+    this.onActualChunkComplete = null;  // (index, timestamp) => {}
+    this.onNaturalComplete = null;      // (index, timestamp) => {}
+    this.onVoicesLoaded = null;     // (voices, selectedVoice) => {}
+    this.onFallbackWarning = null;  // (message) => {}
+    this.actualPlaybackActive = false;
+    this.cloudChunkStartedIndex = null;
+    this.playbackRequestId = 0;
+    this.pendingCloudRequestId = null;
+    this.activeCloudRequestId = null;
+    this.pausedChunkChanged = false;
+    this.transitionTimer = null;
+    this.consecutiveErrorCount = 0;
+    this.generationToken = 0;
+    this.utteranceToken = 0;
+    this.advanceSequenceToken = 0;
+    this.isAdvancingChunk = false;
+    this.autoChunkTransitionTimestamps = [];
+    this.lastChunkEndedTimestamp = null;
+    this.stuckWatchdogTimer = null;
+    this.utteranceStartedTimestamp = null;
+
+    // Bounded Diagnostics (Phase 2 Deterministic Instrumentation & Audit)
+    this.diagnosticsEnabled = false; // Debug mode mặc định tắt
+    this.debugMode = false;
+    this.diagnosticsCounts = {
+      speak: 0,
+      cancel: 0,
+      pause: 0,
+      resume: 0,
+      onstart: 0,
+      onend: 0,
+      onerror: 0,
+      autoAdvance: 0,
+      stuck_watchdog: 0,
+      keepalive_pulse: 0,
+      keepalive_start: 0,
+      keepalive_stop: 0,
+      speakCurrentChunk: 0,
+      speakBrowserChunk: 0,
+      chapterComplete: 0
+    };
+    this.diagnosticsRingBuffer = [];
+    this.maxDiagnosticsEvents = 50;
+
+    // Bounded Queue Scheduler for Cloud TTS Prefetching
+    this.queueScheduler = new TTSQueueScheduler({
+      fetcher: async (text, config, signal) => {
+        return await this.fetchCloudAudio(text, config.provider, config.voice, signal);
+      },
+      cacheLookup: async (key, metadata) => {
+        return await getCachedAudio(key, metadata);
+      },
+      cacheStore: async (key, blob, provider, voice, metadata) => {
+        return await setCachedAudio(key, blob, provider, voice, metadata);
+      }
+    });
+
+    this.initAudioElement();
+    this.initVoices();
+  }
+
+  /**
+   * Initializes HTMLAudioElement events for Cloud TTS streaming.
+   */
+  initAudioElement() {
+    if (!this.audioElement) return;
+
+    this.audioElement.addEventListener('playing', () => {
+      if (this.activeCloudRequestId === null
+        || this.activeCloudRequestId !== this.playbackRequestId) return;
+      if (this.lastChunkEndedTimestamp) {
+        const gapMs = Math.max(0, Date.now() - this.lastChunkEndedTimestamp);
+        if (this.queueScheduler) {
+          this.queueScheduler.recordChunkGap(gapMs);
+        }
+        this.lastChunkEndedTimestamp = null;
+      }
+      if (this.cloudChunkStartedIndex !== this.currentIndex) {
+        this.cloudChunkStartedIndex = this.currentIndex;
+        this.emitPlaybackCallback(this.onActualChunkStart, this.currentIndex);
+        if (this.queueScheduler && this.chunks && this.chunks.length > 0) {
+          this.queueScheduler.markPlaying(this.currentIndex);
+          this.queueScheduler.updateWindow({
+            currentIndex: this.currentIndex,
+            chunks: this.chunks,
+            config: this.cloudConfig,
+            rate: this.rate,
+            generation: this.generationToken
+          });
+        }
+      }
+      this.emitActualPlayback(true);
+    });
+    this.audioElement.addEventListener('pause', () => {
+      if (this.activeCloudRequestId === this.playbackRequestId) {
+        this.emitActualPlayback(false);
+      }
+    });
+
+    this.audioElement.addEventListener('ended', () => {
+      if (this.activeCloudRequestId === null
+        || this.activeCloudRequestId !== this.playbackRequestId) return;
+      this.activeCloudRequestId = null;
+      this.lastChunkEndedTimestamp = Date.now();
+      const completedIndex = this.currentIndex;
+      if (this.queueScheduler) {
+        this.queueScheduler.markConsumed(completedIndex);
+      }
+      const currentGen = this.generationToken;
+      const continuesPlayback = this.isPlaying && !this.isPaused && completedIndex + 1 < this.chunks.length;
+      if (!continuesPlayback) this.emitActualPlayback(false);
+      this.emitPlaybackCallback(this.onActualChunkComplete, completedIndex);
+      this.cloudChunkStartedIndex = null;
+      this.cleanupCurrentAudioUrl();
+      if (typeof this.onChunkEnd === 'function') {
+        this.onChunkEnd(completedIndex);
+      }
+
+      if (this.isPlaying && !this.isPaused && this.generationToken === currentGen) {
+        if (this.checkChunkVelocityCircuitBreaker()) return;
+
+        if (completedIndex + 1 < this.chunks.length) {
+          const nextIndex = completedIndex + 1;
+          const advanceToken = ++this.advanceSequenceToken;
+          this.isAdvancingChunk = true;
+          if (this.transitionTimer) clearTimeout(this.transitionTimer);
+          this.transitionTimer = setTimeout(() => {
+            this.transitionTimer = null;
+            this.isAdvancingChunk = false;
+            if (this.generationToken === currentGen && advanceToken === this.advanceSequenceToken && this.isPlaying && !this.isPaused) {
+              this.currentIndex = nextIndex;
+              this.speakCurrentChunk();
+            }
+          }, 0);
+        } else {
+          this.emitPlaybackCallback(this.onNaturalComplete, completedIndex);
+          this.stop();
+          this.emitStatus('completed');
+        }
+      }
+    });
+
+    this.audioElement.addEventListener('error', (e) => {
+      if (this.activeCloudRequestId === null
+        || this.activeCloudRequestId !== this.playbackRequestId) return;
+      this.emitActualPlayback(false);
+      this.cloudChunkStartedIndex = null;
+      this.activeCloudRequestId = null;
+      this.pendingCloudRequestId = null;
+      console.warn('Lỗi phát Cloud Audio:', e);
+      this.cleanupCurrentAudioUrl();
+
+      // Graceful fallback to browser speech for current chunk
+      if (this.queueScheduler) {
+        this.queueScheduler.invalidate(this.generationToken);
+      }
+      if (typeof this.onFallbackWarning === 'function') {
+        this.onFallbackWarning('Cloud Audio bị lỗi. Tự động chuyển sang giọng trình duyệt.');
+      }
+      this.engine = 'browser';
+      this.speakBrowserChunk(this.chunks[this.currentIndex], this.playbackRequestId);
+    });
+  }
+
+  emitActualPlayback(isPlaying) {
+    const next = Boolean(isPlaying);
+    if (this.actualPlaybackActive === next) return;
+    this.actualPlaybackActive = next;
+    const ts = typeof this.now === 'function' ? this.now() : Date.now();
+    this.emitPlaybackCallback(this.onPlaybackStateChange, next, ts);
+  }
+
+  emitPlaybackCallback(callback, ...args) {
+    if (typeof callback !== 'function') return;
+    try { callback(...args); }
+    catch (error) { console.warn('TTS playback observer failed; playback continues.', error); }
+  }
+
+  /**
+   * Circuit Breaker cấp độ chunk: Phát hiện và dập tắt tức thì callback storm hoặc chuỗi onend lặp bất thường.
+   * Phân biệt giữa hành động chủ động của người dùng (Next/Seek) và vòng lặp tự động.
+   * @returns {boolean} true nếu cầu chì bị ngắt (trip)
+   */
+  checkChunkVelocityCircuitBreaker() {
+    const now = Date.now();
+    this.autoChunkTransitionTimestamps = (this.autoChunkTransitionTimestamps || []).filter(t => now - t < 1000);
+    this.autoChunkTransitionTimestamps.push(now);
+
+    const MAX_AUTO_CHUNKS_PER_SEC = 60;
+    if (this.autoChunkTransitionTimestamps.length >= MAX_AUTO_CHUNKS_PER_SEC) {
+      console.error(`>>> [VietReader] Chunk Velocity Circuit Breaker: Tự động dừng phát do callback storm quá nhanh (${this.autoChunkTransitionTimestamps.length} chunks / 1000ms).`);
+      this.generationToken++;
+      this.advanceSequenceToken++;
+      this.isAdvancingChunk = false;
+      this.stop();
+      this.emitStatus('error');
+      if (typeof this.onFallbackWarning === 'function') {
+        this.onFallbackWarning('Đã tự động dừng phát do phát hiện vòng lặp giọng đọc bất thường để bảo vệ tài nguyên trình duyệt.');
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Initializes available voices with polling fallback to catch asynchronous Edge Neural voices.
+   */
+  initVoices() {
+    if (!this.synth) {
+      console.warn('Web Speech Synthesis không được trình duyệt này hỗ trợ.');
+      return;
+    }
+
+    let pollCount = 0;
+    const maxPolls = 12; // 3 seconds max polling
+
+    const loadVoices = () => {
+      const v = this.synth.getVoices();
+      if (v && v.length > 0) {
+        this.voices = v;
+        this.selectBestVietnameseVoice();
+        if (typeof this.onVoicesLoaded === 'function') {
+          this.onVoicesLoaded(this.voices, this.selectedVoice);
+        }
+        return true;
+      }
+      return false;
+    };
+
+    // Immediate check
+    const loadedImmediately = loadVoices();
+
+    // Polling fallback for delayed Edge Neural / Chrome voice loading
+    if (!loadedImmediately) {
+      const pollTimer = setInterval(() => {
+        pollCount++;
+        if (loadVoices() || pollCount >= maxPolls) {
+          clearInterval(pollTimer);
+        }
+      }, 250);
+    }
+
+    if (this.synth.onvoiceschanged !== undefined) {
+      this.synth.onvoiceschanged = () => {
+        loadVoices();
+      };
+    }
+  }
+
+  /**
+   * Detects and picks the best Vietnamese voice available on the device.
+   * Priority: Edge Online Natural (HoaiMy, Nam) -> Google tiếng Việt -> OS Vietnamese -> Default
+   */
+  selectBestVietnameseVoice() {
+    if (!this.voices || this.voices.length === 0) return null;
+
+    const viVoices = this.voices.filter(v =>
+      v.lang && (v.lang.toLowerCase() === 'vi-vn' || v.lang.toLowerCase().startsWith('vi'))
+    );
+
+    if (viVoices.length > 0) {
+      // Prioritize natural/online neural voices if present
+      const neuralVoice = viVoices.find(v =>
+        /natural|hoaimy|namminh|microsoft nam/i.test(v.name)
+      );
+      const googleVoice = viVoices.find(v =>
+        /google/i.test(v.name)
+      );
+      this.selectedVoice = neuralVoice || googleVoice || viVoices[0];
+    } else {
+      this.selectedVoice = this.voices.find(v => v.default) || this.voices[0];
+    }
+
+    return this.selectedVoice;
+  }
+
+  /**
+   * Switches TTS Engine: 'browser' or 'cloud'
+   */
+  setEngine(engine) {
+    if (engine === 'cloud' || engine === 'browser') {
+      this.engine = engine;
+    }
+  }
+
+  /**
+   * Updates Cloud BYOK configurations.
+   */
+  setCloudConfig(config) {
+    this.cloudConfig = { ...this.cloudConfig, ...config };
+  }
+
+  /**
+   * Retrieves lightweight observability metrics from the Prefetch Queue Scheduler.
+   */
+  getPrefetchMetrics() {
+    return this.queueScheduler ? this.queueScheduler.getMetrics() : null;
+  }
+
+  /**
+   * Enables or disables debug console logging for Cloud TTS prefetch.
+   */
+  setPrefetchDebugMode(enabled) {
+    if (this.queueScheduler) {
+      this.queueScheduler.setDebugMode(enabled);
+    }
+  }
+
+  /**
+   * Records a bounded diagnostics event into aggregate counters and bounded ring buffer.
+   */
+  recordDiagnosticsEvent(type, payload = {}) {
+    if (this.diagnosticsCounts && this.diagnosticsCounts[type] !== undefined) {
+      this.diagnosticsCounts[type]++;
+    }
+    if (!this.diagnosticsEnabled) return;
+    const entry = {
+      type,
+      timestamp: Date.now(),
+      generation: this.generationToken,
+      chunkIndex: this.currentIndex,
+      state: this.isPlaying ? (this.isPaused ? 'paused' : 'playing') : 'idle',
+      origin: payload.origin || 'tts',
+      ...payload
+    };
+    this.diagnosticsRingBuffer.push(entry);
+    if (this.diagnosticsRingBuffer.length > this.maxDiagnosticsEvents) {
+      this.diagnosticsRingBuffer.shift();
+    }
+    if (this.debugMode) {
+      console.log(`[TTS-DIAG] ${entry.type} (chunk ${entry.chunkIndex}, gen ${entry.generation}, origin: ${entry.origin})`);
+    }
+  }
+
+  /**
+   * Returns a clean, bounded snapshot of playback lifecycle state and diagnostics counters.
+   */
+  getDiagnosticsSnapshot() {
+    return {
+      enabled: this.diagnosticsEnabled,
+      debugMode: this.debugMode,
+      generationId: this.generationToken,
+      utteranceToken: this.utteranceToken,
+      advanceSequenceToken: this.advanceSequenceToken,
+      currentIndex: this.currentIndex,
+      isPlaying: this.isPlaying,
+      isPaused: this.isPaused,
+      isAdvancingChunk: this.isAdvancingChunk,
+      counts: { ...this.diagnosticsCounts },
+      hasActiveUtterance: Boolean(this.currentUtterance),
+      hasKeepAliveTimer: Boolean(this.keepAliveTimer),
+      hasTransitionTimer: Boolean(this.transitionTimer),
+      hasStuckWatchdogTimer: Boolean(this.stuckWatchdogTimer),
+      hasCurrentAudioUrl: Boolean(this.currentAudioUrl),
+      activeCloudRequestId: this.activeCloudRequestId,
+      pendingCloudRequestId: this.pendingCloudRequestId,
+      activeAudioResources: Boolean(this.currentAudioUrl || (this.audioElement && this.audioElement.src)),
+      activeCloudRequests: this.queueScheduler ? (this.queueScheduler.activeFetches?.size || 0) : 0,
+      activeTimers: {
+        keepAlive: Boolean(this.keepAliveTimer),
+        transition: Boolean(this.transitionTimer),
+        watchdog: Boolean(this.stuckWatchdogTimer)
+      },
+      recentEvents: [...this.diagnosticsRingBuffer]
+    };
+  }
+
+  /**
+   * Resets diagnostics counters and clears the event ring buffer.
+   */
+  resetDiagnostics() {
+    this.diagnosticsCounts = {
+      speak: 0,
+      cancel: 0,
+      pause: 0,
+      resume: 0,
+      onstart: 0,
+      onend: 0,
+      onerror: 0,
+      autoAdvance: 0,
+      stuck_watchdog: 0,
+      keepalive_pulse: 0,
+      keepalive_start: 0,
+      keepalive_stop: 0,
+      speakCurrentChunk: 0,
+      speakBrowserChunk: 0,
+      chapterComplete: 0
+    };
+    this.diagnosticsRingBuffer = [];
+  }
+
+  /**
+   * Enables or disables diagnostics ring-buffer recording.
+   */
+  setDiagnosticsEnabled(enabled) {
+    this.diagnosticsEnabled = Boolean(enabled);
+    if (!this.diagnosticsEnabled) {
+      this.diagnosticsRingBuffer = [];
+    }
+  }
+
+  /**
+   * Enables or disables debug console logging. Default is false.
+   */
+  setDebugMode(enabled) {
+    this.debugMode = Boolean(enabled);
+  }
+
+  /**
+   * Sets browser voice by URI or Name.
+   */
+  setVoice(voiceURI) {
+    const found = (voiceURI && typeof voiceURI === 'object')
+      ? voiceURI
+      : this.voices.find(v => v.voiceURI === voiceURI || v.name === voiceURI);
+    if (found) {
+      this.selectedVoice = found;
+      if (this.isPlaying && !this.isPaused && this.engine === 'browser') {
+        this.speakCurrentChunk();
+      }
+    }
+  }
+
+  /**
+   * Updates playback rate (0.7 - 2.2).
+   */
+  setRate(newRate) {
+    this.rate = Math.max(0.7, Math.min(2.2, parseFloat(newRate) || 1.0));
+    if (this.isPlaying && !this.isPaused) {
+      this.speakCurrentChunk();
+    }
+  }
+
+  /**
+   * Updates voice pitch (0.5 - 1.5).
+   */
+  setPitch(newPitch) {
+    this.pitch = Math.max(0.5, Math.min(1.5, parseFloat(newPitch) || 1.0));
+    if (this.isPlaying && !this.isPaused && this.engine === 'browser') {
+      this.speakCurrentChunk();
+    }
+  }
+
+  /**
+   * Updates playback volume (0.0 - 1.0) for sleep timer fade-out.
+   */
+  setVolume(newVolume) {
+    this.volume = Math.max(0, Math.min(1, parseFloat(newVolume) !== undefined && !isNaN(parseFloat(newVolume)) ? parseFloat(newVolume) : 1.0));
+    if (this.audioElement) {
+      this.audioElement.volume = this.volume;
+    }
+  }
+
+  /**
+   * Toggles auto scrolling on/off.
+   */
+  setAutoScroll(enabled) {
+    this.autoScrollEnabled = !!enabled;
+  }
+
+  /**
+   * Loads raw text and slices it into TTS chunk sentences.
+   */
+  loadText(fullText) {
+    this.stop();
+    this.chunks = this.splitIntoSmartChunks(fullText);
+    this.currentIndex = 0;
+    if (this.queueScheduler) {
+      this.queueScheduler.cancelAll();
+    }
+  }
+
+  /**
+   * Breaks text down into natural sentences and clauses suitable for TTS.
+   */
+  splitIntoSmartChunks(text) {
+    if (!text || !text.trim()) return [];
+
+    const rawParagraphs = text.split(/\n+/);
+    const resultChunks = [];
+
+    for (const paragraph of rawParagraphs) {
+      const cleanPara = paragraph.trim();
+      if (!cleanPara) continue;
+
+      const sentenceRegex = /[^.!?…;:\n]+[.!?…;:\"'”’»\)\]]*|\S+/g;
+      const rawSentences = cleanPara.match(sentenceRegex) || [cleanPara];
+
+      for (let s of rawSentences) {
+        s = s.trim();
+        if (!s) continue;
+
+        // Bỏ qua hoặc gộp chunk chỉ chứa ký tự đặc biệt/dấu câu không có âm vị phát âm
+        if (!/[\p{L}\p{N}]/u.test(s)) {
+          if (resultChunks.length > 0) {
+            resultChunks[resultChunks.length - 1] += ' ' + s;
+          }
+          continue;
+        }
+
+        if (s.length > 220) {
+          const subClauses = s.split(/,\s+/);
+          let tempBuf = '';
+          for (const sub of subClauses) {
+            if ((tempBuf + sub).length < 180) {
+              tempBuf += (tempBuf ? ', ' : '') + sub;
+            } else {
+              if (tempBuf && /[\p{L}\p{N}]/u.test(tempBuf)) resultChunks.push(tempBuf.trim());
+              tempBuf = sub;
+            }
+          }
+          if (tempBuf && /[\p{L}\p{N}]/u.test(tempBuf)) resultChunks.push(tempBuf.trim());
+        } else {
+          resultChunks.push(s);
+        }
+      }
+    }
+
+    return resultChunks;
+  }
+
+  /**
+   * Starts playing from the current index.
+   */
+  play() {
+    if (this.chunks.length === 0) return;
+
+    if (this.isPaused) {
+      this.resume();
+      return;
+    }
+
+    this.generationToken++;
+    this.advanceSequenceToken++;
+    this.isAdvancingChunk = false;
+    this.autoChunkTransitionTimestamps = [];
+    this.consecutiveErrorCount = 0;
+    this.isPlaying = true;
+    this.isPaused = false;
+    this.emitStatus('playing');
+    this.recordDiagnosticsEvent('play', { chunkIndex: this.currentIndex });
+
+    if (this.synth?.paused) {
+      try { this.synth.resume(); } catch (e) { /* ignore */ }
+    }
+
+    this.startKeepAlive();
+    this.speakCurrentChunk();
+  }
+
+  /**
+   * Pauses TTS playback across browser synth or cloud audio.
+   */
+  pause() {
+    if (!this.isPlaying) return;
+
+    this.generationToken++;
+    this.advanceSequenceToken++;
+    this.isAdvancingChunk = false;
+    this.recordDiagnosticsEvent('pause', { chunkIndex: this.currentIndex });
+
+    if (this.transitionTimer) {
+      clearTimeout(this.transitionTimer);
+      this.transitionTimer = null;
+    }
+    this.clearStuckWatchdog();
+    this.utteranceStartedTimestamp = null;
+
+    if (this.engine === 'cloud' && this.pendingCloudRequestId === this.playbackRequestId) {
+      this.playbackRequestId++;
+      this.pendingCloudRequestId = null;
+      this.activeCloudRequestId = null;
+      this.pausedChunkChanged = true;
+    }
+    if (this.engine === 'cloud' && this.audioElement && !this.audioElement.paused) {
+      this.audioElement.pause();
+    } else if (this.synth) {
+      try { this.synth.pause(); } catch (e) { /* ignore */ }
+    }
+
+    this.emitActualPlayback(false);
+    this.isPaused = true;
+    this.stopKeepAlive();
+    this.emitStatus('paused');
+  }
+
+  /**
+   * Resumes TTS playback.
+   */
+  resume() {
+    if (!this.isPlaying) return;
+
+    if (this.previewUtterance) {
+      this.previewUtterance.onend = null;
+      this.previewUtterance.onerror = null;
+      this.previewUtterance = null;
+    }
+    this.cleanupPreviewAudio();
+
+    this.generationToken++;
+    this.advanceSequenceToken++;
+    this.isAdvancingChunk = false;
+    this.autoChunkTransitionTimestamps = [];
+    this.consecutiveErrorCount = 0;
+    this.recordDiagnosticsEvent('resume', { chunkIndex: this.currentIndex });
+    const speakSelectedChunk = this.pausedChunkChanged || (this.engine === 'browser' && !this.currentUtterance);
+    this.pausedChunkChanged = false;
+    this.isPaused = false;
+    this.emitStatus('playing');
+    this.startKeepAlive();
+
+    if (typeof this.synth?.resume === 'function') {
+      try { this.synth.resume(); } catch (e) { /* ignore */ }
+    }
+
+    if (speakSelectedChunk) {
+      this.speakCurrentChunk();
+      return;
+    }
+
+    if (this.engine === 'cloud' && this.audioElement && this.audioElement.paused) {
+      this.audioElement.play().catch(err => {
+        console.warn('Lỗi tiếp tục phát cloud audio:', err);
+        this.speakCurrentChunk();
+      });
+    }
+
+  }
+
+  /**
+   * Stops TTS playback completely.
+   */
+  stop() {
+    if (this._isStopping) return;
+    this._isStopping = true;
+    try {
+      this.stopKeepAlive();
+      this.clearStuckWatchdog();
+      this.utteranceStartedTimestamp = null;
+      this.generationToken++;
+      this.advanceSequenceToken++;
+      this.isAdvancingChunk = false;
+      this.autoChunkTransitionTimestamps = [];
+      this.recordDiagnosticsEvent('stop', { chunkIndex: this.currentIndex });
+      if (this.transitionTimer) {
+        clearTimeout(this.transitionTimer);
+        this.transitionTimer = null;
+      }
+      this.emitActualPlayback(false);
+      this.cancelCurrentSource();
+      this.pausedChunkChanged = false;
+
+      const wasActive = this.isPlaying || this.isPaused;
+      this.isPlaying = false;
+      this.isPaused = false;
+      this.consecutiveErrorCount = 0;
+      if (wasActive && typeof this.onChunkEnd === 'function') {
+        this.onChunkEnd(this.currentIndex);
+      }
+      this.emitStatus('stopped');
+    } finally {
+      this._isStopping = false;
+    }
+  }
+
+  cancelCurrentSource() {
+    this.playbackRequestId = (this.playbackRequestId || 0) + 1;
+    this.generationToken++;
+    this.advanceSequenceToken++;
+    this.isAdvancingChunk = false;
+    this.recordDiagnosticsEvent('cancel', { chunkIndex: this.currentIndex });
+    if (this.transitionTimer) {
+      clearTimeout(this.transitionTimer);
+      this.transitionTimer = null;
+    }
+    this.clearStuckWatchdog();
+    this.utteranceStartedTimestamp = null;
+    this.emitActualPlayback(false);
+    if (this.previewUtterance) {
+      this.previewUtterance.onend = null;
+      this.previewUtterance.onerror = null;
+      this.previewUtterance = null;
+    }
+    this.cleanupPreviewAudio();
+    this.pendingCloudRequestId = null;
+    this.activeCloudRequestId = null;
+    this.cloudChunkStartedIndex = null;
+    this.lastChunkEndedTimestamp = null;
+    if (this.queueScheduler) {
+      this.queueScheduler.invalidate(this.generationToken);
+    }
+
+    if (this.currentUtterance) {
+      this.currentUtterance.onend = null;
+      this.currentUtterance.onerror = null;
+      this.currentUtterance.onstart = null;
+      this.currentUtterance.onpause = null;
+      this.currentUtterance.onresume = null;
+      this.currentUtterance = null;
+    }
+
+    if (this.synth) {
+      try {
+        this.synth.cancel();
+      } catch (e) {
+        // ignore
+      }
+      if (this.synth.paused) {
+        try { this.synth.resume(); } catch (e) { /* ignore */ }
+      }
+    }
+
+    if (this.audioElement && (this.currentAudioUrl || this.audioElement.src)) {
+      if (typeof this.audioElement.pause === 'function') {
+        this.audioElement.pause();
+      }
+      this.audioElement.currentTime = 0;
+      this.cleanupCurrentAudioUrl();
+    }
+  }
+
+  /**
+   * Navigates to next sentence.
+   */
+  next() {
+    if (this.currentIndex < this.chunks.length - 1) {
+      this.generationToken++;
+      this.advanceSequenceToken++;
+      this.isAdvancingChunk = false;
+      this.autoChunkTransitionTimestamps = [];
+      this.consecutiveErrorCount = 0;
+      if (this.transitionTimer) {
+        clearTimeout(this.transitionTimer);
+        this.transitionTimer = null;
+      }
+      this.currentIndex++;
+      if (this.isPlaying && this.isPaused) {
+        this.cancelCurrentSource();
+        this.pausedChunkChanged = true;
+        this.emitChunkStart();
+      } else if (this.isPlaying) {
+        this.speakCurrentChunk();
+      } else {
+        this.emitChunkStart();
+      }
+    }
+  }
+
+  /**
+   * Navigates to previous sentence.
+   */
+  prev() {
+    if (this.currentIndex > 0) {
+      this.generationToken++;
+      this.advanceSequenceToken++;
+      this.isAdvancingChunk = false;
+      this.autoChunkTransitionTimestamps = [];
+      this.consecutiveErrorCount = 0;
+      if (this.transitionTimer) {
+        clearTimeout(this.transitionTimer);
+        this.transitionTimer = null;
+      }
+      this.currentIndex--;
+      if (this.isPlaying && this.isPaused) {
+        this.cancelCurrentSource();
+        this.pausedChunkChanged = true;
+        this.emitChunkStart();
+      } else if (this.isPlaying) {
+        this.speakCurrentChunk();
+      } else {
+        this.emitChunkStart();
+      }
+    }
+  }
+
+  /**
+   * Jumps directly to a given sentence chunk.
+   */
+  jumpToIndex(index, autoPlay = true) {
+    if (index >= 0 && index < this.chunks.length) {
+      this.generationToken++;
+      this.advanceSequenceToken++;
+      this.isAdvancingChunk = false;
+      this.autoChunkTransitionTimestamps = [];
+      this.consecutiveErrorCount = 0;
+      if (this.transitionTimer) {
+        clearTimeout(this.transitionTimer);
+        this.transitionTimer = null;
+      }
+      this.currentIndex = index;
+      if (this.queueScheduler) {
+        this.queueScheduler.invalidate(this.generationToken);
+      }
+      if (autoPlay) {
+        this.pausedChunkChanged = false;
+        this.isPlaying = true;
+        this.isPaused = false;
+        this.emitStatus('playing');
+        this.startKeepAlive();
+        this.speakCurrentChunk();
+      } else {
+        if (this.isPlaying && this.isPaused) {
+          this.cancelCurrentSource();
+          this.pausedChunkChanged = true;
+        }
+        this.emitChunkStart();
+      }
+    }
+  }
+
+  /**
+   * Speaks the current chunk based on active engine.
+   */
+  speakCurrentChunk() {
+    if (!this.chunks || this.chunks.length === 0) {
+      this.stop();
+      return;
+    }
+
+    if (this.currentIndex >= this.chunks.length) {
+      this.stop();
+      this.emitStatus('completed');
+      return;
+    }
+
+    const chunkText = this.chunks[this.currentIndex];
+    const requestId = this.playbackRequestId = (this.playbackRequestId || 0) + 1;
+    this.recordDiagnosticsEvent('speakCurrentChunk', { chunkIndex: this.currentIndex, origin: 'speakCurrentChunk' });
+    this.pendingCloudRequestId = null;
+    this.activeCloudRequestId = null;
+    this.cloudChunkStartedIndex = null;
+
+    // Chỉ tạm dừng và giải phóng audio element nếu thực sự có URL hoặc audio source đang nạp (Cloud TTS)
+    if (this.currentAudioUrl || (this.audioElement && this.audioElement.src)) {
+      if (this.audioElement && typeof this.audioElement.pause === 'function') {
+        this.audioElement.pause();
+      }
+      if (this.audioElement) {
+        this.audioElement.currentTime = 0;
+      }
+      this.cleanupCurrentAudioUrl();
+    }
+
+    if (this.engine === 'cloud' && this.cloudConfig.apiKey) {
+      return this.speakCloudChunk(chunkText, requestId);
+    } else {
+      return this.speakBrowserChunk(chunkText, requestId);
+    }
+  }
+
+  /**
+   * Tier 1: Browser Web Speech API playback with pitch & rate tuning.
+   * Dọn dẹp Utterance an toàn tuyệt đối, chống rò rỉ bộ nhớ và chặn lặp vô hạn Chromium.
+   */
+  speakBrowserChunk(chunkText, requestId = this.playbackRequestId) {
+    if (!this.synth) return;
+
+    // 1. Kiểm tra session & generation hợp lệ
+    const activeGeneration = this.generationToken;
+    if (requestId !== this.playbackRequestId || !this.isPlaying || this.isPaused) {
+      return;
+    }
+    this.recordDiagnosticsEvent('speakBrowserChunk', { chunkIndex: this.currentIndex, origin: 'speakBrowserChunk' });
+
+    // 2. Dọn dẹp an toàn utterance cũ nếu còn tồn tại
+    if (this.currentUtterance) {
+      this.currentUtterance.onend = null;
+      this.currentUtterance.onerror = null;
+      this.currentUtterance.onstart = null;
+      this.currentUtterance.onpause = null;
+      this.currentUtterance.onresume = null;
+      this.currentUtterance = null;
+      if (this.synth) {
+        this.recordDiagnosticsEvent('cancel', { chunkIndex: this.currentIndex, origin: 'speakBrowserChunk:cleanup' });
+        try { this.synth.cancel(); } catch (e) { /* ignore */ }
+      }
+    }
+    this.clearStuckWatchdog();
+
+    // 3. Khôi phục trạng thái synth nếu đang bị paused do keep-alive hoặc Chromium glitch
+    if (this.synth.paused) {
+      this.recordDiagnosticsEvent('resume', { chunkIndex: this.currentIndex, origin: 'speakBrowserChunk:unpause' });
+      try { this.synth.resume(); } catch (e) { /* ignore */ }
+    }
+
+    // 4. Chặn đọc chuỗi rỗng hoặc chỉ có dấu câu không có âm vị phát âm: Tìm câu hợp lệ kế tiếp
+    const validText = typeof chunkText === 'string' ? chunkText : (chunkText != null ? String(chunkText) : '');
+    const hasPhonemes = /[\p{L}\p{N}]/u.test(validText);
+    if (!validText.trim() || !hasPhonemes) {
+      while (this.currentIndex < this.chunks.length) {
+        const item = this.chunks[this.currentIndex];
+        const itemText = typeof item === 'string' ? item : (item != null ? String(item) : '');
+        if (itemText.trim() && /[\p{L}\p{N}]/u.test(itemText)) break;
+        this.currentIndex++;
+      }
+      if (this.currentIndex < this.chunks.length) {
+        this.speakCurrentChunk();
+      } else {
+        this.stop();
+        this.emitStatus('completed');
+      }
+      return;
+    }
+
+    const utterance = new SpeechSynthesisUtterance(validText);
+    this.currentUtterance = utterance;
+    const currentUttToken = ++this.utteranceToken;
+
+    if (this.selectedVoice) {
+      utterance.voice = this.selectedVoice;
+      utterance.lang = this.selectedVoice.lang || 'vi-VN';
+    } else {
+      utterance.lang = 'vi-VN';
+    }
+
+    utterance.rate = this.rate;
+    utterance.pitch = this.pitch;
+    utterance.volume = this.volume;
+
+    // Khóa completion duy nhất cho mỗi utterance instance
+    let isTerminalHandled = false;
+
+    // Thiết lập watchdog bảo vệ chống treo native SpeechSynthesis (14s tối thiểu)
+    this.scheduleStuckWatchdog(utterance, currentUttToken, activeGeneration, validText.length);
+
+    utterance.onstart = () => {
+      if (this.currentUtterance === utterance && !this.isPaused) {
+        this.utteranceStartedTimestamp = Date.now();
+        this.scheduleStuckWatchdog(utterance, currentUttToken, activeGeneration, validText.length);
+        this.recordDiagnosticsEvent('onstart', { chunkIndex: this.currentIndex });
+        this.emitPlaybackCallback(this.onActualChunkStart, this.currentIndex);
+        this.emitActualPlayback(true);
+        if (
+          this.generationToken !== activeGeneration ||
+          this.utteranceToken !== currentUttToken ||
+          !this.isPlaying
+        ) {
+          return;
+        }
+        this.consecutiveErrorCount = 0;
+        this.emitChunkStart();
+      }
+    };
+
+    utterance.onpause = () => {
+      if (
+        this.generationToken === activeGeneration &&
+        this.utteranceToken === currentUttToken &&
+        this.currentUtterance === utterance
+      ) {
+        this.emitActualPlayback(false);
+      }
+    };
+
+    utterance.onresume = () => {
+      if (
+        this.generationToken === activeGeneration &&
+        this.utteranceToken === currentUttToken &&
+        this.currentUtterance === utterance &&
+        this.isPlaying
+      ) {
+        this.emitActualPlayback(true);
+      }
+    };
+
+    utterance.onend = () => {
+      if (isTerminalHandled) return;
+      isTerminalHandled = true;
+
+      this.clearStuckWatchdog();
+      this.utteranceStartedTimestamp = null;
+
+      // Gỡ bỏ callback ngay lập tức để chống Chromium bắn sự kiện lặp vô hạn
+      utterance.onend = null;
+      utterance.onerror = null;
+      utterance.onstart = null;
+      utterance.onpause = null;
+      utterance.onresume = null;
+
+      if (this.currentUtterance === utterance) {
+        this.currentUtterance = null;
+      }
+
+      if (
+        this.generationToken !== activeGeneration ||
+        this.utteranceToken !== currentUttToken ||
+        !this.isPlaying ||
+        this.isPaused
+      ) {
+        return;
+      }
+
+      const completedIndex = this.currentIndex;
+      this.recordDiagnosticsEvent('onend', { chunkIndex: completedIndex });
+      const continuesPlayback = completedIndex + 1 < this.chunks.length;
+      if (!continuesPlayback) this.emitActualPlayback(false);
+      this.emitPlaybackCallback(this.onActualChunkComplete, completedIndex);
+
+      this.consecutiveErrorCount = 0;
+
+      if (typeof this.onChunkEnd === 'function') {
+        this.onChunkEnd(completedIndex);
+      }
+
+      if (
+        !this.isPlaying ||
+        this.isPaused ||
+        this.generationToken !== activeGeneration ||
+        this.utteranceToken !== currentUttToken
+      ) {
+        return;
+      }
+
+      // CIRCUIT BREAKER: Kiểm tra tốc độ hoàn thành chunk chống callback storm
+      if (this.checkChunkVelocityCircuitBreaker()) {
+        return;
+      }
+
+      if (completedIndex + 1 < this.chunks.length) {
+        const nextIndex = completedIndex + 1;
+        const advanceToken = ++this.advanceSequenceToken;
+        this.isAdvancingChunk = true;
+        this.recordDiagnosticsEvent('autoAdvance', { nextIndex });
+
+        if (this.transitionTimer) clearTimeout(this.transitionTimer);
+        this.transitionTimer = setTimeout(() => {
+          this.transitionTimer = null;
+          this.isAdvancingChunk = false;
+
+          if (
+            this.generationToken !== activeGeneration ||
+            advanceToken !== this.advanceSequenceToken ||
+            !this.isPlaying ||
+            this.isPaused
+          ) {
+            return;
+          }
+
+          this.currentIndex = nextIndex;
+          this.speakCurrentChunk();
+        }, 0);
+      } else {
+        // ĐÃ ĐỌC HẾT CHƯƠNG:
+        this.stopKeepAlive();
+        this.recordDiagnosticsEvent('chapterComplete', { chunkIndex: completedIndex, origin: 'onNaturalComplete' });
+        this.emitPlaybackCallback(this.onNaturalComplete, completedIndex);
+        this.stop();
+        this.emitStatus('completed');
+      }
+    };
+
+    utterance.onerror = (e) => {
+      if (isTerminalHandled) return;
+      isTerminalHandled = true;
+
+      this.clearStuckWatchdog();
+      this.utteranceStartedTimestamp = null;
+
+      utterance.onend = null;
+      utterance.onerror = null;
+      utterance.onstart = null;
+      utterance.onpause = null;
+      utterance.onresume = null;
+
+      if (this.currentUtterance === utterance) {
+        this.currentUtterance = null;
+        this.emitActualPlayback(false);
+      }
+
+      // Bỏ qua lỗi ngắt do người dùng chủ động thao tác
+      if (e.error === 'interrupted' || e.error === 'canceled') return;
+
+      if (
+        this.generationToken !== activeGeneration ||
+        this.utteranceToken !== currentUttToken ||
+        !this.isPlaying ||
+        this.isPaused
+      ) {
+        return;
+      }
+
+      this.recordDiagnosticsEvent('onerror', { chunkIndex: this.currentIndex, error: e?.error || 'unknown' });
+      console.warn('Lỗi phát Web Speech API:', e);
+
+      // CIRCUIT BREAKER: Kiểm tra ngưỡng lỗi liên tiếp để ngắt an toàn chống callback storm
+      this.consecutiveErrorCount = (this.consecutiveErrorCount || 0) + 1;
+      const MAX_CONSECUTIVE_ERRORS = 3;
+
+      if (this.consecutiveErrorCount >= MAX_CONSECUTIVE_ERRORS) {
+        console.error(`>>> [VietReader] Circuit Breaker: Dừng phát sau ${this.consecutiveErrorCount} lỗi Web Speech liên tiếp.`);
+        this.generationToken++;
+        this.advanceSequenceToken++;
+        this.isAdvancingChunk = false;
+        this.stop();
+        this.emitStatus('error');
+        if (typeof this.onFallbackWarning === 'function') {
+          this.onFallbackWarning('Đã tự động dừng phát do lỗi giọng đọc trình duyệt liên tiếp.');
+        }
+        return;
+      }
+
+      if (this.checkChunkVelocityCircuitBreaker()) {
+        return;
+      }
+
+      // Nếu chưa vượt ngưỡng lỗi, chuyển sang câu kế tiếp với asynchronous handoff
+      const completedIndex = this.currentIndex;
+      if (typeof this.onChunkEnd === 'function') {
+        this.onChunkEnd(completedIndex);
+      }
+      if (completedIndex + 1 < this.chunks.length) {
+        const nextIndex = completedIndex + 1;
+        const advanceToken = ++this.advanceSequenceToken;
+        this.isAdvancingChunk = true;
+
+        if (this.transitionTimer) clearTimeout(this.transitionTimer);
+        this.transitionTimer = setTimeout(() => {
+          this.transitionTimer = null;
+          this.isAdvancingChunk = false;
+
+          if (
+            this.generationToken !== activeGeneration ||
+            advanceToken !== this.advanceSequenceToken ||
+            !this.isPlaying ||
+            this.isPaused
+          ) {
+            return;
+          }
+
+          this.currentIndex = nextIndex;
+          this.speakCurrentChunk();
+        }, 0);
+      } else {
+        this.stopKeepAlive();
+        this.stop();
+        this.emitStatus('completed');
+      }
+    };
+
+    this.recordDiagnosticsEvent('speak', { chunkIndex: this.currentIndex, textLen: validText.length });
+    this.synth.speak(utterance);
+  }
+  /**
+   * Tier 2: Cloud AI TTS playback with IndexedDB caching & automatic fallback.
+   */
+  async speakCloudChunk(chunkText, requestId = this.playbackRequestId) {
+    this.pendingCloudRequestId = requestId;
+    this.emitChunkStart();
+
+    const provider = this.cloudConfig.provider || 'fpt';
+    const voice = this.cloudConfig.voice || 'banmai';
+    const model = this.cloudConfig.model || '';
+    const cacheKey = buildCacheKey({
+      text: chunkText,
+      provider,
+      voice,
+      model,
+      rate: this.rate
+    });
+    const metadata = { provider, voice, model, rate: this.rate, textHash: hashText(chunkText) };
+
+    try {
+      // 1. Request audio chunk via Queue Scheduler (cache-first, coalesced in-flight, or bounded fetch)
+      let audioBlob = null;
+      if (this.queueScheduler) {
+        audioBlob = await this.queueScheduler.requestChunk({
+          chunkIndex: this.currentIndex,
+          text: chunkText,
+          config: this.cloudConfig,
+          rate: this.rate,
+          generation: this.generationToken
+        });
+      } else {
+        try {
+          audioBlob = await getCachedAudio(cacheKey, metadata);
+        } catch (cacheErr) {
+          console.warn('Lỗi truy cập cache IndexedDB:', cacheErr);
+        }
+        if (requestId !== this.playbackRequestId || !this.isPlaying || this.isPaused) return;
+
+        if (!audioBlob) {
+          audioBlob = await this.fetchCloudAudio(chunkText, provider, voice);
+          if (requestId !== this.playbackRequestId || !this.isPlaying || this.isPaused) return;
+          if (audioBlob) {
+            setCachedAudio(cacheKey, audioBlob, provider, voice, metadata).catch(e => console.warn(e));
+          }
+        }
+      }
+      if (requestId !== this.playbackRequestId || !this.isPlaying || this.isPaused) return;
+
+      if (!audioBlob) {
+        throw new Error('Không nhận được dữ liệu âm thanh từ Cloud API.');
+      }
+
+      // 3. Play audio blob via Audio element
+      this.cleanupCurrentAudioUrl();
+      if (typeof URL !== 'undefined' && URL.createObjectURL && this.audioElement) {
+        this.currentAudioUrl = URL.createObjectURL(audioBlob);
+        this.activeCloudRequestId = requestId;
+        this.cloudChunkStartedIndex = null;
+        this.audioElement.src = this.currentAudioUrl;
+        this.audioElement.playbackRate = 1.0; // Rate is controlled at generation or natively
+        this.audioElement.volume = this.volume;
+        await this.audioElement.play();
+        if (this.lastChunkEndedTimestamp) {
+          const gapMs = Math.max(0, Date.now() - this.lastChunkEndedTimestamp);
+          if (this.queueScheduler) {
+            this.queueScheduler.recordChunkGap(gapMs);
+          }
+          this.lastChunkEndedTimestamp = null;
+        }
+        if (this.queueScheduler && this.chunks && this.chunks.length > 0 && this.cloudChunkStartedIndex !== this.currentIndex) {
+          this.cloudChunkStartedIndex = this.currentIndex;
+          this.emitPlaybackCallback(this.onActualChunkStart, this.currentIndex);
+          this.queueScheduler.markPlaying(this.currentIndex);
+          this.queueScheduler.updateWindow({
+            currentIndex: this.currentIndex,
+            chunks: this.chunks,
+            config: this.cloudConfig,
+            rate: this.rate,
+            generation: this.generationToken
+          });
+        }
+      } else {
+        // Fallback for environment without HTMLAudioElement
+        if (requestId !== this.playbackRequestId || !this.isPlaying || this.isPaused) return;
+        this.speakBrowserChunk(chunkText, requestId);
+      }
+
+    } catch (err) {
+      if (requestId !== this.playbackRequestId || !this.isPlaying || this.isPaused) return;
+      const isAbort = err?.name === 'AbortError' || /abort/i.test(err?.message || '');
+      if (isAbort) return;
+
+      const shouldFallback = this.activeCloudRequestId === requestId || this.pendingCloudRequestId === requestId;
+      this.activeCloudRequestId = null;
+      this.cleanupCurrentAudioUrl();
+      console.warn(`Lỗi Cloud TTS [${provider}]:`, err.message);
+      if (shouldFallback) {
+        if (this.queueScheduler) {
+          this.queueScheduler.invalidate(this.generationToken);
+        }
+        if (typeof this.onFallbackWarning === 'function') {
+          this.onFallbackWarning(`Cloud AI (${provider}) lỗi: ${err.message}. Đã tự động chuyển về giọng trình duyệt.`);
+        }
+        // Graceful fallback to Browser Web Speech API
+        this.engine = 'browser';
+        this.speakBrowserChunk(chunkText, requestId);
+      }
+    } finally {
+      if (this.pendingCloudRequestId === requestId) this.pendingCloudRequestId = null;
+    }
+  }
+
+  /**
+   * Fetches audio blob from Cloud AI provider (FPT AI, OpenAI, or Custom).
+   */
+  async fetchCloudAudio(text, provider, voice, signal = null) {
+    return await executeFetchCloudAudio({
+      text,
+      provider: provider || this.cloudConfig.provider,
+      voice: voice || this.cloudConfig.voice,
+      config: this.cloudConfig,
+      rate: this.rate,
+      signal
+    });
+  }
+
+  /**
+   * Polls and downloads audio file from FPT CDN until ready.
+   */
+  async downloadAudioWithRetry(url, maxRetries = 6, delayMs = 800, signal = null) {
+    return await executeDownloadAudioWithRetry(url, maxRetries, delayMs, signal);
+  }
+
+  /**
+   * Previews a voice by speaking a short Vietnamese sentence:
+   * "Chào bạn, tôi là giọng đọc tiếng Việt của VietReader."
+   */
+  async previewVoice(voiceIdOrUri, engine = 'browser', pitch = 1.0, rate = 1.0) {
+    const sampleText = 'Chào bạn, tôi là giọng đọc tiếng Việt của VietReader.';
+
+    const wasPlaying = this.isPlaying && !this.isPaused;
+    if (engine === 'cloud' && this.cloudConfig.apiKey) {
+      this.cleanupPreviewAudio();
+      if (this.isPlaying) {
+        this.cancelCurrentSource();
+        this.pausedChunkChanged = true;
+        this.isPaused = true;
+        if (wasPlaying) this.emitStatus('paused');
+      } else {
+        this.cancelCurrentSource();
+      }
+      const previewRequestId = this.previewRequestId;
+      try {
+        const provider = this.cloudConfig.provider || 'fpt';
+        const voice = voiceIdOrUri || this.cloudConfig.voice || 'banmai';
+        const blob = await this.fetchCloudAudio(sampleText, provider, voice);
+        if (previewRequestId !== this.previewRequestId) return false;
+        const AudioCtor = typeof Audio !== 'undefined' ? Audio : globalThis.window?.Audio;
+        if (blob && typeof URL !== 'undefined' && AudioCtor) {
+          const url = URL.createObjectURL(blob);
+          const previewAudio = new AudioCtor(url);
+          this.previewAudio = previewAudio;
+          this.previewAudioUrl = url;
+          const cleanup = () => {
+            if (this.previewAudio !== previewAudio) return;
+            this.cleanupPreviewAudio();
+            if (wasPlaying && this.isPlaying && this.isPaused) this.resume();
+          };
+          previewAudio.onended = cleanup;
+          previewAudio.onerror = cleanup;
+          try {
+            await previewAudio.play();
+            if (previewRequestId !== this.previewRequestId) return false;
+          } catch (err) {
+            if (this.previewAudio === previewAudio) {
+              previewAudio.onended = null;
+              previewAudio.onerror = null;
+              try { previewAudio.pause(); } catch (pauseError) { /* ignore */ }
+              this.previewAudio = null;
+              if (this.previewAudioUrl === url) {
+                try { URL.revokeObjectURL(url); } catch (revokeError) { /* ignore */ }
+                this.previewAudioUrl = null;
+              }
+            }
+            if (wasPlaying && this.isPlaying && this.isPaused) this.resume();
+            throw err;
+          }
+          return true;
+        }
+      } catch (err) {
+        if (wasPlaying && this.isPlaying && this.isPaused) this.resume();
+        if (previewRequestId !== this.previewRequestId) return false;
+        console.warn('Lỗi nghe thử Cloud Voice:', err);
+        throw err;
+      }
+    }
+
+    if (!this.synth) return false;
+
+    if (this.isPlaying) {
+      this.cancelCurrentSource();
+      this.pausedChunkChanged = true;
+      this.isPaused = true;
+      if (wasPlaying) this.emitStatus('paused');
+    } else {
+      this.cancelCurrentSource();
+    }
+
+    const utterance = new SpeechSynthesisUtterance(sampleText);
+    this.previewUtterance = utterance;
+    utterance.lang = 'vi-VN';
+    utterance.rate = rate;
+    utterance.pitch = pitch;
+
+    const finishPreview = () => {
+      utterance.onend = null;
+      utterance.onerror = null;
+      if (this.previewUtterance === utterance) this.previewUtterance = null;
+      if (wasPlaying && this.isPlaying && this.isPaused) this.resume();
+    };
+    utterance.onend = finishPreview;
+    utterance.onerror = finishPreview;
+
+    const matchedVoice = this.voices.find(v => v.voiceURI === voiceIdOrUri || v.name === voiceIdOrUri);
+    if (matchedVoice) utterance.voice = matchedVoice;
+    else if (this.selectedVoice) utterance.voice = this.selectedVoice;
+
+    this.synth.speak(utterance);
+    return true;
+  }
+  cleanupPreviewAudio() {
+    this.previewRequestId = (this.previewRequestId || 0) + 1;
+    if (this.previewAudio) {
+      this.previewAudio.onended = null;
+      this.previewAudio.onerror = null;
+      try { this.previewAudio.pause(); } catch (e) { /* ignore */ }
+      this.previewAudio = null;
+    }
+    if (this.previewAudioUrl && typeof URL !== 'undefined' && URL.revokeObjectURL) {
+      try { URL.revokeObjectURL(this.previewAudioUrl); } catch (e) { /* ignore */ }
+      this.previewAudioUrl = null;
+    }
+  }
+
+  cleanupCurrentAudioUrl() {
+    if (this.audioElement && (this.currentAudioUrl || this.audioElement.src)) {
+      try {
+        this.audioElement.removeAttribute('src');
+        if (typeof this.audioElement.load === 'function') {
+          this.audioElement.load();
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+    if (this.currentAudioUrl && typeof URL !== 'undefined' && URL.revokeObjectURL) {
+      try {
+        URL.revokeObjectURL(this.currentAudioUrl);
+      } catch (e) {
+        // ignore
+      }
+      this.currentAudioUrl = null;
+    }
+  }
+
+  emitChunkStart() {
+    if (typeof this.onChunkStart === 'function') {
+      this.onChunkStart(
+        this.currentIndex,
+        this.chunks[this.currentIndex] || '',
+        this.chunks.length
+      );
+    }
+  }
+
+  emitStatus(status) {
+    if (typeof this.onStatusChange === 'function') {
+      this.onStatusChange(status);
+    }
+  }
+
+  /**
+   * Kiểm tra xem giọng đọc có phải là giọng trực tuyến / Natural Neural stream hay không.
+   * Giọng trực tuyến truyền tải qua WebSocket trong Browser Process; tuyệt đối không pulse pause/resume.
+   */
+  isNaturalOrOnlineVoice(voice = this.selectedVoice) {
+    if (!voice) return true; // Safe default: Không phát xung nếu chưa nhận diện được voice
+    const name = voice.name || '';
+    const uri = voice.voiceURI || '';
+    return /natural|online|neural|hoaimy|namminh|microsoft nam|google/i.test(name) ||
+           /natural|online|neural|hoaimy|namminh|microsoft nam|google/i.test(uri);
+  }
+
+  startKeepAlive() {
+    this.stopKeepAlive();
+    this.recordDiagnosticsEvent('keepalive_start', { chunkIndex: this.currentIndex, origin: 'startKeepAlive' });
+    this.keepAliveTimer = setInterval(() => {
+      if (
+        this.engine !== 'browser' ||
+        !this.synth ||
+        !this.isPlaying ||
+        this.isPaused ||
+        !this.currentUtterance ||
+        this.isAdvancingChunk ||
+        !this.synth.speaking ||
+        this.synth.paused
+      ) {
+        return;
+      }
+
+      // Giọng Online / Natural (Edge Neural voices) truyền stream qua WebSocket trong Browser Process.
+      // Tuyệt đối không pulse pause/resume trên dòng stream này để tránh làm vỡ buffer và rò rỉ RAM native.
+      if (this.isNaturalOrOnlineVoice(this.selectedVoice)) {
+        return;
+      }
+
+      // Đối với giọng offline / SAPI truyền thống trên Windows:
+      // Chỉ pulse nếu câu nói liên tục trên 10 giây (khắc phục Chromium 15s SAPI timeout).
+      const elapsed = this.utteranceStartedTimestamp ? (Date.now() - this.utteranceStartedTimestamp) : 0;
+      if (elapsed >= 10000) {
+        this.recordDiagnosticsEvent('keepalive_pulse', { chunkIndex: this.currentIndex, elapsed });
+        try {
+          this.synth.pause();
+          this.synth.resume();
+        } catch (e) {
+          // ignore
+        }
+      }
+    }, 10000);
+    if (this.keepAliveTimer && typeof this.keepAliveTimer.unref === 'function') {
+      this.keepAliveTimer.unref();
+    }
+  }
+
+  stopKeepAlive() {
+    if (this.keepAliveTimer) {
+      clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = null;
+      this.recordDiagnosticsEvent('keepalive_stop', { chunkIndex: this.currentIndex, origin: 'stopKeepAlive' });
+    }
+  }
+
+  /**
+   * Thiết lập watchdog giám sát native SpeechSynthesis.
+   * Nếu trình duyệt Edge bị kẹt (treo không phát onend/onerror), dừng phát an toàn và chuyển sang trạng thái lỗi.
+   * TUYỆT ĐỐI KHÔNG tự động emit onActualChunkComplete (hoàn tất ảo), KHÔNG tự tăng currentIndex, và KHÔNG tự động chuyển câu lặp vô hạn.
+   */
+  scheduleStuckWatchdog(utterance, currentUttToken, activeGeneration, textLength, customTimeoutMs = null) {
+    this.clearStuckWatchdog();
+    const watchdogTimeoutMs = customTimeoutMs !== null ? customTimeoutMs : Math.max(14000, (textLength || 50) * 200);
+    this.stuckWatchdogTimer = setTimeout(() => {
+      this.stuckWatchdogTimer = null;
+      if (
+        this.generationToken !== activeGeneration ||
+        this.utteranceToken !== currentUttToken ||
+        !this.isPlaying ||
+        this.isPaused ||
+        this.currentUtterance !== utterance
+      ) {
+        return;
+      }
+
+      console.warn(`>>> [VietReader] Watchdog: Phát hiện Web Speech bị treo (${watchdogTimeoutMs}ms). Dừng phát an toàn để bảo vệ bộ nhớ.`);
+      this.recordDiagnosticsEvent('stuck_watchdog', { chunkIndex: this.currentIndex, timeoutMs: watchdogTimeoutMs });
+
+      utterance.onend = null;
+      utterance.onerror = null;
+      utterance.onstart = null;
+      utterance.onpause = null;
+      utterance.onresume = null;
+
+      if (this.currentUtterance === utterance) {
+        this.currentUtterance = null;
+      }
+
+      if (this.synth) {
+        this.recordDiagnosticsEvent('cancel', { chunkIndex: this.currentIndex, origin: 'stuckWatchdog' });
+        try { this.synth.cancel(); } catch (e) { /* ignore */ }
+      }
+
+      // Cleanup timers & playback tracking
+      this.stopKeepAlive();
+      this.utteranceStartedTimestamp = null;
+      if (this.transitionTimer) {
+        clearTimeout(this.transitionTimer);
+        this.transitionTimer = null;
+      }
+
+      this.emitActualPlayback(false);
+
+      // Unhighlight câu hiện tại trên UI
+      if (typeof this.onChunkEnd === 'function') {
+        this.onChunkEnd(this.currentIndex);
+      }
+
+      // FAIL-SAFE AN TOÀN TUYỆT ĐỐI:
+      // 1. Không emit onActualChunkComplete -> Không ghi nhận tiến độ giả vào ReadingHistory.
+      // 2. Không tăng currentIndex -> Giữ nguyên vị trí câu gặp sự cố để người dùng có thể thử lại.
+      // 3. Không tự động gọi speakCurrentChunk() -> Ngắt triệt để vòng lặp dồn ép RAM native.
+      this.generationToken++;
+      this.advanceSequenceToken++;
+      this.isAdvancingChunk = false;
+      this.isPlaying = false;
+      this.isPaused = false;
+      this.consecutiveErrorCount = 0;
+
+      if (typeof this.onFallbackWarning === 'function') {
+        this.onFallbackWarning('Giọng đọc trình duyệt phản hồi quá lâu hoặc bị gián đoạn. Đã tạm dừng an toàn.');
+      }
+
+      this.emitStatus('error');
+    }, watchdogTimeoutMs);
+
+    if (this.stuckWatchdogTimer && typeof this.stuckWatchdogTimer.unref === 'function') {
+      this.stuckWatchdogTimer.unref();
+    }
+  }
+
+  clearStuckWatchdog() {
+    if (this.stuckWatchdogTimer) {
+      clearTimeout(this.stuckWatchdogTimer);
+      this.stuckWatchdogTimer = null;
+    }
+  }
+}

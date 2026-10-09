@@ -1,0 +1,418 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  TTSQueueScheduler,
+  QUEUE_ENTRY_STATES,
+  makeConfigFingerprint
+} from './ttsQueueScheduler.js';
+
+const delay = ms => new Promise(r => setTimeout(r, ms));
+
+// Helper to create a controlled promise
+function createDeferred() {
+  let resolve, reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+test('1. Priority Ordering: Priority 1 (Current) > Priority 2 (N+1) > Priority 3 (N+2)', async () => {
+  const fetchOrder = [];
+  const deferreds = {};
+
+  const scheduler = new TTSQueueScheduler({
+    config: { maxConcurrency: 1, maxWindowAhead: 2 },
+    fetcher: async (text) => {
+      fetchOrder.push(text);
+      deferreds[text] = createDeferred();
+      return deferreds[text].promise;
+    }
+  });
+
+  const chunks = ['Đoạn 0 (Current)', 'Đoạn 1 (N+1)', 'Đoạn 2 (N+2)'];
+  // Set window at index 0: 0 -> prio 1, 1 -> prio 2, 2 -> prio 3
+  scheduler.updateWindow({
+    currentIndex: 0,
+    chunks,
+    config: { provider: 'fpt', voice: 'banmai' }
+  });
+
+  // Chunk 0 must start first because Priority 1 > Priority 2
+  await delay(10);
+  assert.equal(fetchOrder.length, 1);
+  assert.equal(fetchOrder[0], 'Đoạn 0 (Current)');
+
+  // Complete Chunk 0 -> Next should be Chunk 1 (Priority 2)
+  deferreds['Đoạn 0 (Current)'].resolve(new Blob(['audio 0']));
+  await delay(10);
+
+  assert.equal(fetchOrder.length, 2);
+  assert.equal(fetchOrder[1], 'Đoạn 1 (N+1)');
+
+  // Complete Chunk 1 -> Next should be Chunk 2 (Priority 3)
+  deferreds['Đoạn 1 (N+1)'].resolve(new Blob(['audio 1']));
+  await delay(10);
+
+  assert.equal(fetchOrder.length, 3);
+  assert.equal(fetchOrder[2], 'Đoạn 2 (N+2)');
+
+  deferreds['Đoạn 2 (N+2)'].resolve(new Blob(['audio 2']));
+  await delay(10);
+
+  scheduler.dispose();
+});
+
+test('2. Bounded Window: Working window strictly contains at most current + maxWindowAhead', async () => {
+  const scheduler = new TTSQueueScheduler({
+    config: { maxConcurrency: 1, maxWindowAhead: 2 }
+  });
+
+  const chunks = Array.from({ length: 10 }, (_, i) => `Đoạn ${i}`);
+  scheduler.updateWindow({
+    currentIndex: 3,
+    chunks,
+    config: { provider: 'openai', voice: 'nova' }
+  });
+
+  const snapshot = scheduler.getSnapshot();
+  // Working window for currentIndex=3 with maxWindowAhead=2 must ONLY contain chunks 3, 4, 5
+  assert.equal(snapshot.totalEntries, 3);
+  const queuedIndices = snapshot.entries.map(e => e.chunkIndex).sort((a, b) => a - b);
+  assert.deepEqual(queuedIndices, [3, 4, 5]);
+
+  scheduler.dispose();
+});
+
+test('3. Bounded Concurrency: In-flight network requests strictly cannot exceed maxConcurrency', async () => {
+  let activeFetches = 0;
+  let maxObservedConcurrency = 0;
+  const deferreds = [];
+
+  const scheduler = new TTSQueueScheduler({
+    config: { maxConcurrency: 1, maxWindowAhead: 2 },
+    fetcher: async () => {
+      activeFetches++;
+      if (activeFetches > maxObservedConcurrency) {
+        maxObservedConcurrency = activeFetches;
+      }
+      const def = createDeferred();
+      deferreds.push(def);
+      return def.promise;
+    }
+  });
+
+  const chunks = ['Đoạn 0', 'Đoạn 1', 'Đoạn 2'];
+  scheduler.updateWindow({ currentIndex: 0, chunks });
+  await delay(15);
+
+  assert.equal(maxObservedConcurrency, 1, 'Max concurrency must be strictly 1');
+  assert.equal(activeFetches, 1);
+
+  // Complete first request
+  activeFetches--;
+  deferreds[0].resolve(new Blob(['audio 0']));
+  await delay(15);
+
+  assert.equal(maxObservedConcurrency, 1, 'Concurrency remains bounded at 1 when next starts');
+
+  // Complete second request
+  activeFetches--;
+  deferreds[1].resolve(new Blob(['audio 1']));
+  await delay(15);
+
+  // Complete third request
+  activeFetches--;
+  deferreds[2].resolve(new Blob(['audio 2']));
+  await delay(15);
+
+  assert.equal(activeFetches, 0);
+  scheduler.dispose();
+});
+
+test('3b. Bounded Concurrency: Allows maxConcurrency = 2 when configured', async () => {
+  let activeFetches = 0;
+  let maxObservedConcurrency = 0;
+  const deferreds = [];
+
+  const scheduler = new TTSQueueScheduler({
+    config: { maxConcurrency: 2, maxWindowAhead: 2 },
+    fetcher: async () => {
+      activeFetches++;
+      if (activeFetches > maxObservedConcurrency) {
+        maxObservedConcurrency = activeFetches;
+      }
+      const def = createDeferred();
+      deferreds.push(def);
+      return def.promise;
+    }
+  });
+
+  const chunks = ['Đoạn 0', 'Đoạn 1', 'Đoạn 2'];
+  scheduler.updateWindow({ currentIndex: 0, chunks });
+  await delay(20);
+
+  assert.equal(maxObservedConcurrency, 2, 'With maxConcurrency=2, two requests can run concurrently');
+
+  for (const def of deferreds) {
+    activeFetches--;
+    def.resolve(new Blob(['audio']));
+  }
+  await delay(20);
+
+  scheduler.dispose();
+});
+
+test('4. Request Coalescing: Duplicate and concurrent requests share the exact same Promise', async () => {
+  let fetchCallCount = 0;
+  const def = createDeferred();
+
+  const scheduler = new TTSQueueScheduler({
+    fetcher: async () => {
+      fetchCallCount++;
+      return def.promise;
+    }
+  });
+
+  const config = { provider: 'fpt', voice: 'banmai' };
+  // 1. Enqueue via prefetch (Priority 2)
+  scheduler.updateWindow({
+    currentIndex: 0,
+    chunks: ['Đoạn 0', 'Đoạn 1'],
+    config
+  });
+  await delay(10);
+
+  // 2. Playback actively asks for Chunk 0 while it is in-flight
+  const reqPromise1 = scheduler.requestChunk({ chunkIndex: 0, text: 'Đoạn 0', config });
+  const reqPromise2 = scheduler.requestChunk({ chunkIndex: 0, text: 'Đoạn 0', config });
+
+  assert.equal(reqPromise1, reqPromise2, 'Both requests must return the identical Promise instance');
+  assert.equal(fetchCallCount, 1, 'Fetcher must only be called once');
+
+  def.resolve(new Blob(['shared audio blob']));
+  const [res1, res2] = await Promise.all([reqPromise1, reqPromise2]);
+
+  assert.equal(res1, res2, 'Both callers receive the exact same Blob');
+  scheduler.dispose();
+});
+
+test('5. Out-of-Order Completion: Faster task finishing before slower task updates state cleanly', async () => {
+  const def0 = createDeferred();
+  const def1 = createDeferred();
+
+  const scheduler = new TTSQueueScheduler({
+    config: { maxConcurrency: 2, maxWindowAhead: 2 },
+    fetcher: async (text) => {
+      if (text === 'Đoạn 0') return def0.promise;
+      if (text === 'Đoạn 1') return def1.promise;
+      return new Blob(['dummy']);
+    }
+  });
+
+  scheduler.updateWindow({
+    currentIndex: 0,
+    chunks: ['Đoạn 0', 'Đoạn 1']
+  });
+  await delay(15);
+
+  // Chunk 1 completes BEFORE Chunk 0!
+  def1.resolve(new Blob(['audio 1']));
+  await delay(15);
+
+  const entry1 = scheduler.getEntry(1);
+  assert.equal(entry1.state, QUEUE_ENTRY_STATES.READY);
+  const entry0 = scheduler.getEntry(0);
+  assert.equal(entry0.state, QUEUE_ENTRY_STATES.FETCHING);
+
+  // Then Chunk 0 completes
+  def0.resolve(new Blob(['audio 0']));
+  await delay(15);
+
+  assert.equal(entry0.state, QUEUE_ENTRY_STATES.READY);
+  scheduler.dispose();
+});
+
+test('6. Seek Changes Priority & Shifts Window: In-flight distant prefetch is aborted', async () => {
+  let chunk1Aborted = false;
+  const def1 = createDeferred();
+
+  const scheduler = new TTSQueueScheduler({
+    config: { maxConcurrency: 1, maxWindowAhead: 2 },
+    fetcher: async (text, cfg, signal) => {
+      if (text === 'Đoạn 1') {
+        signal.addEventListener('abort', () => { chunk1Aborted = true; });
+        return def1.promise;
+      }
+      return new Blob([`audio for ${text}`]);
+    }
+  });
+
+  const chunks = Array.from({ length: 20 }, (_, i) => `Đoạn ${i}`);
+  // Initial window: [0, 1, 2]
+  scheduler.updateWindow({ currentIndex: 0, chunks });
+  await delay(15);
+
+  // Now user seeks to chunk 10!
+  scheduler.updateWindow({ currentIndex: 10, chunks });
+  await delay(15);
+
+  // Chunk 1 must be aborted because it fell outside the new window [10, 11, 12]
+  assert.equal(chunk1Aborted, true, 'Distant in-flight prefetch must be aborted on seek');
+
+  // Chunk 10 must be Priority 1 and present
+  const entry10 = scheduler.getEntry(10);
+  assert.ok(entry10);
+  assert.equal(entry10.priority, 1);
+
+  scheduler.dispose();
+});
+
+test('7. Stop / Invalidate: All pending entries are cancelled and AbortControllers triggered', async () => {
+  let abortCount = 0;
+  const scheduler = new TTSQueueScheduler({
+    config: { maxConcurrency: 2 },
+    fetcher: async (text, cfg, signal) => {
+      signal.addEventListener('abort', () => { abortCount++; });
+      return new Promise(() => {}); // never resolves
+    }
+  });
+
+  const chunks = ['Đoạn 0', 'Đoạn 1', 'Đoạn 2'];
+  scheduler.updateWindow({ currentIndex: 0, chunks });
+  await delay(15);
+
+  // Invalidate / Stop
+  scheduler.invalidate(99);
+  await delay(15);
+
+  assert.ok(abortCount > 0, 'Active abort controllers must be triggered');
+  const snapshot = scheduler.getSnapshot();
+  assert.equal(snapshot.totalEntries, 0, 'Old generation entries must be purged');
+
+  scheduler.dispose();
+});
+
+test('8. Late Result After Invalidation: Late result cannot mutate new generation or leak', async () => {
+  const lateDeferred = createDeferred();
+  let lateBlob = null;
+
+  const scheduler = new TTSQueueScheduler({
+    fetcher: async () => {
+      return lateDeferred.promise;
+    }
+  });
+
+  // Generation 1 starts fetching
+  scheduler.updateWindow({
+    currentIndex: 0,
+    chunks: ['Câu gen 1'],
+    generation: 1
+  });
+  await delay(10);
+
+  // User stops or changes chapter -> Generation 2
+  scheduler.invalidate(2);
+  await delay(10);
+
+  // Late promise resolves after invalidation
+  lateBlob = new Blob(['stale audio']);
+  lateDeferred.resolve(lateBlob);
+  await delay(10);
+
+  const snapshot = scheduler.getSnapshot();
+  assert.equal(snapshot.currentGeneration, 2);
+  assert.equal(snapshot.totalReadyBytes, 0, 'Late result must not add to ready bytes');
+  assert.equal(scheduler.getEntry(0, null, 1), null, 'Old entry must not exist in memory');
+
+  scheduler.dispose();
+});
+
+test('9. Bounded Memory on Repeated Enqueue: Calling updateWindow repeatedly does not grow queue unbounded', async () => {
+  const scheduler = new TTSQueueScheduler({
+    config: { maxWindowAhead: 2 },
+    fetcher: async () => new Blob(['audio'])
+  });
+
+  const chunks = ['Đoạn 0', 'Đoạn 1', 'Đoạn 2'];
+  for (let i = 0; i < 50; i++) {
+    scheduler.updateWindow({ currentIndex: 0, chunks });
+  }
+  await delay(15);
+
+  const snapshot = scheduler.getSnapshot();
+  assert.ok(snapshot.totalEntries <= 3, `Queue entries must not exceed 3 (was: ${snapshot.totalEntries})`);
+
+  scheduler.dispose();
+});
+
+test('10. Memory Limits: Evicts lowest priority ready blobs when exceeding maxReadyEntries', async () => {
+  const scheduler = new TTSQueueScheduler({
+    config: { maxConcurrency: 3, maxWindowAhead: 5, maxReadyEntries: 2 },
+    fetcher: async (text) => new Blob([`audio for ${text}`])
+  });
+
+  const chunks = ['Đoạn 0 (p1)', 'Đoạn 1 (p2)', 'Đoạn 2 (p3)', 'Đoạn 3 (p4)'];
+  scheduler.updateWindow({ currentIndex: 0, chunks });
+  await delay(30);
+
+  const readyEntries = Array.from(scheduler.entries.values()).filter(e => e.state === QUEUE_ENTRY_STATES.READY);
+  assert.ok(readyEntries.length <= 2, `Ready entries must be bounded by maxReadyEntries=2 (was: ${readyEntries.length})`);
+  // Priority 1 must ALWAYS be preserved
+  const p1 = scheduler.getEntry(0);
+  assert.ok(p1 && p1.state === QUEUE_ENTRY_STATES.READY, 'Priority 1 must not be evicted');
+
+  scheduler.dispose();
+});
+
+test('11. Dispose / Cleanup is Idempotent: Multiple calls safe, resources freed', async () => {
+  const scheduler = new TTSQueueScheduler({
+    fetcher: async () => new Blob(['audio'])
+  });
+
+  scheduler.updateWindow({ currentIndex: 0, chunks: ['A', 'B'] });
+  await delay(10);
+
+  // Call dispose multiple times
+  assert.doesNotThrow(() => scheduler.dispose());
+  assert.doesNotThrow(() => scheduler.dispose());
+  assert.doesNotThrow(() => scheduler.dispose());
+
+  const snapshot = scheduler.getSnapshot();
+  assert.equal(snapshot.totalEntries, 0);
+  assert.equal(snapshot.activeFetchesCount, 0);
+  assert.equal(snapshot.totalReadyBytes, 0);
+});
+
+test('12. No Duplicate Scheduler Loop: High-frequency triggering executes sequentially', async () => {
+  let concurrentExecutions = 0;
+  let maxConcurrentPumps = 0;
+
+  const scheduler = new TTSQueueScheduler({
+    config: { maxConcurrency: 1 },
+    fetcher: async () => new Blob(['audio'])
+  });
+
+  // Spy on internal _processQueue to verify pump serialization
+  const origProcess = scheduler._processQueue.bind(scheduler);
+  scheduler._processQueue = () => {
+    concurrentExecutions++;
+    if (concurrentExecutions > maxConcurrentPumps) {
+      maxConcurrentPumps = concurrentExecutions;
+    }
+    origProcess();
+    concurrentExecutions--;
+  };
+
+  const chunks = ['Đoạn 0', 'Đoạn 1', 'Đoạn 2'];
+  // Fire rapid triggers concurrently
+  for (let i = 0; i < 20; i++) {
+    scheduler.updateWindow({ currentIndex: 0, chunks });
+    scheduler._triggerPump();
+  }
+  await delay(30);
+
+  assert.equal(maxConcurrentPumps, 1, 'Scheduler pump must NEVER run concurrently with itself');
+  scheduler.dispose();
+});

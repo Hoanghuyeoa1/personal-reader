@@ -1,0 +1,120 @@
+diff --git a/diagnostics/phase4_before_sleepTimer.js.txt b/sleepTimer.js
+index e1c7f77..9d42a4b 100644
+--- a/diagnostics/phase4_before_sleepTimer.js.txt
++++ b/sleepTimer.js
+@@ -34,6 +34,9 @@ export class SleepTimer {
+     this.isFading = false;
+     this.baseTtsVolume = 1.0;
+     this.baseAmbientVolume = 1.0;
++    this.generation = 0;
++    this.destroyed = false;
++    this.wasChapterEndTriggered = false;
+   }
+ 
+   /**
+@@ -43,7 +46,10 @@ export class SleepTimer {
+    * @param {number} [baseAmbientVolume=1.0]
+    */
+   start(minutes, baseTtsVolume = 1.0, baseAmbientVolume = 1.0) {
++    if (this.destroyed) return;
+     this.clearTimer();
++    const generation = this.generation;
++    this.wasChapterEndTriggered = false;
+ 
+     const mins = Math.max(1, parseFloat(minutes) || 15);
+     this.mode = 'time';
+@@ -56,9 +62,10 @@ export class SleepTimer {
+     // Emit initial tick
+     this.emitTick();
+ 
++    if (generation !== this.generation || this.mode !== 'time') return;
+     // Start 1-second interval
+     this.timerId = setInterval(() => {
+-      this.tick();
++      if (generation === this.generation && !this.destroyed) this.tick();
+     }, 1000);
+     if (typeof this.timerId?.unref === 'function') {
+       this.timerId.unref();
+@@ -71,7 +78,9 @@ export class SleepTimer {
+    * @param {number} [baseAmbientVolume=1.0]
+    */
+   setChapterEndMode(baseTtsVolume = 1.0, baseAmbientVolume = 1.0) {
++    if (this.destroyed) return;
+     this.clearTimer();
++    this.wasChapterEndTriggered = false;
+ 
+     this.mode = 'chapter_end';
+     this.totalSeconds = 0;
+@@ -91,13 +100,12 @@ export class SleepTimer {
+ 
+     this.clearTimer();
+ 
+-    if (this.isFading && typeof this.onFade === 'function') {
+-      this.onFade(1.0);
+-    }
+-
++    const wasFading = this.isFading;
+     this.mode = null;
+     this.isFading = false;
+     this.remainingSeconds = 0;
++    this.wasChapterEndTriggered = false;
++    if (wasFading && typeof this.onFade === 'function') this.onFade(1.0);
+ 
+     if (typeof this.onCancel === 'function') {
+       this.onCancel();
+@@ -161,7 +169,8 @@ export class SleepTimer {
+    * Internal per-second tick handler.
+    */
+   tick() {
+-    if (this.mode !== 'time') return;
++    if (this.destroyed || this.mode !== 'time') return;
++    const generation = this.generation;
+ 
+     this.remainingSeconds--;
+ 
+@@ -174,12 +183,13 @@ export class SleepTimer {
+       }
+     }
+ 
++    if (generation !== this.generation || this.mode !== 'time') return;
+     // Check expiration
+     if (this.remainingSeconds <= 0) {
+       if (typeof this.onFade === 'function') {
+         this.onFade(0);
+       }
+-      this.expire('timer');
++      if (generation === this.generation && this.mode === 'time') this.expire('timer');
+       return;
+     }
+ 
+@@ -191,6 +201,7 @@ export class SleepTimer {
+    * @param {'timer'|'chapter_end'} reason
+    */
+   expire(reason = 'timer') {
++    if (this.destroyed || !this.mode) return;
+     this.clearTimer();
+ 
+     const previousMode = this.mode;
+@@ -210,6 +221,7 @@ export class SleepTimer {
+    * Clears internal interval timer.
+    */
+   clearTimer() {
++    this.generation++;
+     if (this.timerId) {
+       clearInterval(this.timerId);
+       this.timerId = null;
+@@ -219,6 +231,14 @@ export class SleepTimer {
+   /**
+    * Emits current tick status to listener.
+    */
++  destroy() {
++    if (this.destroyed) return;
++    this.cancel();
++    this.clearTimer();
++    this.destroyed = true;
++    this.onTick = this.onFade = this.onExpire = this.onCancel = null;
++  }
++
+   emitTick() {
+     if (typeof this.onTick === 'function') {
+       this.onTick(this.getStatus());

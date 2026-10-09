@@ -1,0 +1,907 @@
+diff --git a/diagnostics/phase3_before_app.js.txt b/app.js
+index 532b9ae..011c6f8 100644
+--- a/diagnostics/phase3_before_app.js.txt
++++ b/app.js
+@@ -46,6 +46,7 @@ import {
+   VIETNAMESE_VOICE_CATALOG,
+   formatBrowserVoiceLabel
+ } from './tts.js';
++import { buildChapterChunkMap, createChunkAnchor, resolveSavedChunkIndex } from './chunkMapping.js';
+ 
+ import {
+   cleanChapterText,
+@@ -134,11 +135,15 @@ let bookmarkFocusTimer = null;
+ let lastReadingActivitySignalAt = 0;
+ let lastHistoryAutoScrollState = null;
+ let logicalProgressMap = null;
++let readerChunkMap = null;
++let restoringChunkPosition = false;
++let readerTextReloadGeneration = 0;
+ let actualTtsPlaybackActive = false;
+ let activeProgressTtsChunkIndex = null;
+ let lastCompletedProgressTtsChunkIndex = null;
+ let readerProgressRebasePending = false;
+ let chapterLoadGeneration = 0;
++let readerNavigationGeneration = 0;
+ let scrollRestoreTimeout = null;
+ let currentTtsChapterIndex = null;
+ let scrollSaveTimeout = null;
+@@ -595,15 +600,41 @@ async function initStorageAndSettings() {
+ let isChapterSwitching = false;
+ let chapterSwitchHistory = [];
+ let ttsProgressSaveTimeout = null;
++let pendingTtsProgress = null;
++let automaticChapterHandoff = null;
++let chapterHandoffDelay = null;
++let chapterHandoffUnlockTimer = null;
+ 
+-function flushTtsProgressSave() {
+-  if (ttsProgressSaveTimeout) {
+-    clearTimeout(ttsProgressSaveTimeout);
+-    ttsProgressSaveTimeout = null;
+-    if (state.currentBook) {
+-      updateProgress(state.currentBook.id, state.currentChapterIndex, calculateOverallProgress(), window.scrollY, state.currentBook.currentChunkIndex || 0);
+-    }
++function cancelChapterHandoff() {
++  automaticChapterHandoff = null;
++  if (chapterHandoffDelay) {
++    clearTimeout(chapterHandoffDelay.timer);
++    chapterHandoffDelay.resolve();
++    chapterHandoffDelay = null;
+   }
++  if (chapterHandoffUnlockTimer) clearTimeout(chapterHandoffUnlockTimer);
++  chapterHandoffUnlockTimer = null;
++  isChapterSwitching = false;
++}
++
++function isReaderChunkMapCurrent(mapping = readerChunkMap) {
++  return !!mapping && mapping === readerChunkMap && mapping.generation === chapterLoadGeneration &&
++    Number(mapping.bookId) === Number(state.currentBook?.id) && mapping.chapterIndex === state.currentChapterIndex &&
++    state.tts?.chunkMap === mapping;
++}
++
++function currentChunkAnchor(index = state.tts?.currentIndex) {
++  return isReaderChunkMapCurrent() ? createChunkAnchor(readerChunkMap, index, state.currentChapterIndex) : null;
++}
++
++function flushTtsProgressSave() {
++  if (ttsProgressSaveTimeout) clearTimeout(ttsProgressSaveTimeout);
++  ttsProgressSaveTimeout = null;
++  const pending = pendingTtsProgress;
++  pendingTtsProgress = null;
++  if (!pending || !isReaderChunkMapCurrent(pending.mapping) || pending.index !== state.tts.currentIndex) return;
++  void updateProgress(pending.bookId, pending.chapterIndex, calculateOverallProgress(), window.scrollY,
++    pending.index, pending.anchor);
+ }
+ 
+ /**
+@@ -627,11 +658,14 @@ function initTTSEngine() {
+ 
+   // Actual playback edges only (utterance start/audio playing), separate from intent/status UI.
+   state.tts.onPlaybackStateChange = (isPlaying, timestamp) => {
++    if (isPlaying && !isReaderChunkMapCurrent()) return;
+     actualTtsPlaybackActive = isPlaying;
+     const signal = isPlaying ? markReadingHistoryTtsStart : markReadingHistoryTtsPause;
+     void signal(timestamp).catch(error => console.warn('Reading History TTS signal failed:', error));
+   };
+   state.tts.onActualChunkStart = index => {
++    if (!isReaderChunkMapCurrent()) return;
++    if (isChapterSwitching) cancelChapterHandoff();
+     const chunk = logicalProgressMap?.chunks.get(Number(index));
+     if (!chunk) return;
+     const followsPrevious = lastCompletedProgressTtsChunkIndex !== null
+@@ -647,6 +681,7 @@ function initTTSEngine() {
+     activeProgressTtsChunkIndex = Number(index);
+   };
+   state.tts.onActualChunkComplete = index => {
++    if (!isReaderChunkMapCurrent()) return;
+     const chunk = logicalProgressMap?.chunks.get(Number(index));
+     if (!chunk || activeProgressTtsChunkIndex !== Number(index)) return;
+     recordReadingHistoryChapterProgress({
+@@ -658,6 +693,7 @@ function initTTSEngine() {
+     activeProgressTtsChunkIndex = null;
+   };
+   state.tts.onNaturalComplete = () => {
++    if (!isReaderChunkMapCurrent()) return;
+     const targetChapter = Number.isSafeInteger(currentTtsChapterIndex) ? currentTtsChapterIndex : state.currentChapterIndex;
+     if (targetChapter >= 0) {
+       markReadingHistoryChapterCompleted(targetChapter, Date.now());
+@@ -676,13 +712,8 @@ function initTTSEngine() {
+ 
+   // When TTS speaks a chunk
+   state.tts.onChunkStart = (index, text, total) => {
+-    // Bước 8: Chỉ gỡ khóa an toàn sau khi câu đầu tiên của chương mới đã cất tiếng đọc thành công
+-    if (isChapterSwitching) {
+-      isChapterSwitching = false;
+-      console.log('>>> [VietReader] Đã cất tiếng đọc câu đầu tiên chương mới. Đã mở khóa an toàn isChapterSwitching.');
+-    }
+-
+-    highlightSentenceChunk(index);
++    if (!isReaderChunkMapCurrent() || !readerChunkMap.chunks[index]) return;
++    highlightSentenceChunk(index, { scroll: !restoringChunkPosition });
+     if (DOM.ttsPreviewText) {
+       DOM.ttsPreviewText.textContent = text;
+     }
+@@ -702,13 +733,14 @@ function initTTSEngine() {
+ 
+     if (state.currentBook) {
+       state.currentBook.currentChunkIndex = index;
++      state.currentBook.ttsChunkAnchor = currentChunkAnchor(index);
++      pendingTtsProgress = { bookId: state.currentBook.id, chapterIndex: state.currentChapterIndex,
++        mapping: readerChunkMap, index, anchor: state.currentBook.ttsChunkAnchor };
+       clearTimeout(ttsProgressSaveTimeout);
+-      ttsProgressSaveTimeout = setTimeout(() => {
+-        ttsProgressSaveTimeout = null;
+-        if (state.currentBook) {
+-          updateProgress(state.currentBook.id, state.currentChapterIndex, calculateOverallProgress(), window.scrollY, index);
+-        }
++      const timer = setTimeout(() => {
++        if (ttsProgressSaveTimeout === timer) flushTtsProgressSave();
+       }, 500);
++      ttsProgressSaveTimeout = timer;
+     }
+   };
+ 
+@@ -719,7 +751,9 @@ function initTTSEngine() {
+ 
+   // TTS playback status changed
+   state.tts.onStatusChange = async (status) => {
++    if (status === 'completed' && !isReaderChunkMapCurrent()) return;
+     updateTTSPlayPauseButton(status);
++    if (!restoringChunkPosition && ['stopped', 'paused', 'error'].includes(status)) cancelChapterHandoff();
+ 
+     if (status === 'paused' || status === 'stopped' || status === 'error' || status === 'completed') {
+       flushTtsProgressSave();
+@@ -782,6 +816,7 @@ function initTTSEngine() {
+         || 0;
+ 
+       if (state.currentChapterIndex < totalChapters - 1) {
++        let handoff = null;
+         try {
+           // Bước 1: Dừng toàn bộ âm thanh, xóa sạch currentUtterance và timers
+           if (state.tts) {
+@@ -793,51 +828,52 @@ function initTTSEngine() {
+ 
+           // Bước 3: Gọi hàm chuyển chương bất đồng bộ
+           const nextIndex = state.currentChapterIndex + 1;
+-          await loadChapter(nextIndex);
+-
+-          // Bước 4 - Nghỉ bắt buộc: Chờ khoảng đệm an toàn 800ms - 1000ms để trình duyệt hoàn tất render DOM và Garbage Collector dọn sạch RAM
+-          await new Promise(resolve => setTimeout(resolve, 800));
+-
+-          // Bước 5 - Kiểm tra dữ liệu hợp lệ: Lấy nội dung chương mới, kiểm tra nghiêm ngặt
+-          const newContent = state.currentChapter?.content || '';
+-          if (!newContent || newContent.trim().length < 20) {
+-            console.warn('>>> [VietReader] Nội dung chương mới rỗng hoặc dưới 20 ký tự. Dừng phát để tránh vòng lặp 0ms.');
+-            if (state.tts) state.tts.stop();
+-            isChapterSwitching = false;
+-            showToast('Chương mới không có đủ nội dung văn bản.', 'warning');
++          const loading = loadChapter(nextIndex);
++          handoff = { bookId: state.currentBook.id, chapterGeneration: chapterLoadGeneration,
++            navigationGeneration: readerNavigationGeneration, playbackGeneration: state.tts.generationToken };
++          automaticChapterHandoff = handoff;
++          isChapterSwitching = true;
++          const ownsHandoff = () => automaticChapterHandoff === handoff &&
++            handoff.chapterGeneration === chapterLoadGeneration && handoff.navigationGeneration === readerNavigationGeneration &&
++            handoff.playbackGeneration === state.tts.generationToken && Number(state.currentBook?.id) === Number(handoff.bookId);
++          const loaded = await loading;
++          if (!loaded || automaticChapterHandoff !== handoff || handoff.chapterGeneration !== chapterLoadGeneration ||
++              handoff.navigationGeneration !== readerNavigationGeneration || Number(state.currentBook?.id) !== Number(handoff.bookId)) {
++            if (automaticChapterHandoff === handoff) cancelChapterHandoff();
+             return;
+           }
+-
+-          // Bước 6: Nạp nội dung mới vào state.tts.loadText
+-          const rules = await getCustomRules(state.currentBook.id);
+-          const cleanedNewContent = cleanChapterText(newContent, {
+-            rules,
+-            enableCleaner: state.enableGlobalCleaner
++          handoff.playbackGeneration = state.tts.generationToken;
++          await new Promise(resolve => {
++            const timer = setTimeout(() => {
++              if (chapterHandoffDelay?.timer === timer) chapterHandoffDelay = null;
++              resolve();
++            }, 800);
++            chapterHandoffDelay = { timer, resolve };
+           });
+-          state.tts.loadText(cleanedNewContent || newContent);
+-
+-          // Bước 7: Bắt đầu đọc từ câu đầu tiên
+-          if (state.tts.chunks && state.tts.chunks.length > 0) {
+-            console.log('>>> [VietReader] Khởi động phát TTS cho chương mới từ câu đầu tiên...');
+-            state.tts.jumpToIndex(0, true);
+-
+-            // Timeout an toàn phòng hờ nếu trình duyệt không bắn onChunkStart do lỗi engine
+-            setTimeout(() => {
+-              if (isChapterSwitching) {
+-                console.warn('>>> [VietReader] Timeout an toàn: Tự động giải phóng isChapterSwitching.');
+-                isChapterSwitching = false;
+-              }
++          if (!ownsHandoff()) {
++            if (automaticChapterHandoff === handoff) cancelChapterHandoff();
++            return;
++          }
++          const mapping = readerChunkMap;
++          // loadChapter already cleaned, rendered and loaded this SAME canonical map.
++          if (!isReaderChunkMapCurrent(mapping) || mapping.sourceText.trim().length < 20 || !state.tts.chunks.length) {
++            cancelChapterHandoff();
++            state.tts.stop();
++            showToast('Chương mới không có đủ nội dung để phát.', 'warning');
++            return;
++          }
++          state.tts.jumpToIndex(0, true);
++          if (automaticChapterHandoff === handoff) {
++            chapterHandoffUnlockTimer = setTimeout(() => {
++              if (automaticChapterHandoff === handoff && readerChunkMap === mapping) cancelChapterHandoff();
+             }, 8000);
+-          } else {
+-            console.warn('>>> [VietReader] Mảng chunks rỗng sau khi nạp chương mới.');
+-            if (state.tts) state.tts.stop();
+-            isChapterSwitching = false;
+           }
+ 
+         } catch (err) {
+           console.error('>>> [VietReader] Lỗi khi tự động chuyển chương:', err);
++          if (!handoff || automaticChapterHandoff !== handoff || handoff.chapterGeneration !== chapterLoadGeneration) return;
++          cancelChapterHandoff();
+           if (state.tts) state.tts.stop();
+-          isChapterSwitching = false;
+           showToast('Lỗi khi tải chương kế tiếp.', 'error');
+         }
+       } else {
+@@ -954,7 +990,8 @@ function updateTTSPlayPauseButton(status) {
+ /**
+  * Highlights a sentence span in the reader view and auto-scrolls to it.
+  */
+-function highlightSentenceChunk(index) {
++function highlightSentenceChunk(index, { scroll = true } = {}) {
++  if (!isReaderChunkMapCurrent() || !Number.isSafeInteger(index) || !readerChunkMap.chunks[index]) return;
+   document.querySelectorAll('.tts-chunk.active-tts-chunk').forEach(el => {
+     el.classList.remove('active-tts-chunk');
+   });
+@@ -962,7 +999,7 @@ function highlightSentenceChunk(index) {
+   const targetSpan = document.querySelector(`.tts-chunk[data-chunk-index="${index}"]`);
+   if (targetSpan) {
+     targetSpan.classList.add('active-tts-chunk');
+-    if (state.settings.ttsAutoScroll) {
++    if (scroll && state.settings.ttsAutoScroll) {
+       targetSpan.scrollIntoView({ behavior: 'smooth', block: 'center' });
+     }
+   }
+@@ -1153,7 +1190,7 @@ function bindEventListeners() {
+   DOM.btnToggleTtsDock.addEventListener('click', () => {
+     if (state.isDockMinimized || DOM.ttsDock.style.display === 'none') {
+       expandDock();
+-      if (!state.tts.isPlaying) {
++      if (isReaderChunkMapCurrent() && !state.tts.isPlaying) {
+         state.tts.play();
+       }
+     } else {
+@@ -1180,8 +1217,8 @@ function bindEventListeners() {
+   // Scrubber interactive seeking
+   if (DOM.dockScrubber) {
+     DOM.dockScrubber.addEventListener('input', (e) => {
+-      const idx = parseInt(e.target.value, 10);
+-      if (isNaN(idx)) return;
++      const idx = Number(e.target.value);
++      if (!isReaderChunkMapCurrent() || !Number.isSafeInteger(idx) || !readerChunkMap.chunks[idx]) return;
+       const total = state.tts.chunks.length;
+       const percent = total > 0 ? Math.round(((idx + 1) / total) * 100) : 0;
+       if (DOM.dockProgressLabel) {
+@@ -1194,14 +1231,15 @@ function bindEventListeners() {
+     });
+ 
+     DOM.dockScrubber.addEventListener('change', (e) => {
+-      const idx = parseInt(e.target.value, 10);
+-      if (isNaN(idx)) return;
++      const idx = Number(e.target.value);
++      if (!isReaderChunkMapCurrent() || !Number.isSafeInteger(idx) || !readerChunkMap.chunks[idx]) return;
+       const autoPlay = state.tts.isPlaying && !state.tts.isPaused;
+       state.tts.jumpToIndex(idx, autoPlay);
+     });
+   }
+ 
+   DOM.btnTtsPlayToggle.addEventListener('click', () => {
++    if (!isReaderChunkMapCurrent()) return;
+     if (state.tts.isPlaying && !state.tts.isPaused) {
+       state.tts.pause();
+     } else {
+@@ -1214,10 +1252,12 @@ function bindEventListeners() {
+   });
+ 
+   DOM.btnTtsPrev.addEventListener('click', () => {
++    if (!isReaderChunkMapCurrent()) return;
+     state.tts.prev();
+   });
+ 
+   DOM.btnTtsNext.addEventListener('click', () => {
++    if (!isReaderChunkMapCurrent()) return;
+     state.tts.next();
+   });
+ 
+@@ -1678,14 +1718,14 @@ function handleKeyboardShortcuts(e) {
+     // Left Arrow: Rewind 1 chunk
+     if (e.key === 'ArrowLeft') {
+       e.preventDefault();
+-      if (state.tts) state.tts.prev();
++      if (isReaderChunkMapCurrent()) state.tts.prev();
+       return;
+     }
+ 
+     // Right Arrow: Forward 1 chunk
+     if (e.key === 'ArrowRight') {
+       e.preventDefault();
+-      if (state.tts) state.tts.next();
++      if (isReaderChunkMapCurrent()) state.tts.next();
+       return;
+     }
+ 
+@@ -2275,10 +2315,12 @@ async function navigateToGlobalSearchResult(resultIndex) {
+   clearSearchFocusHighlight();
+   closeGlobalSearch();
+ 
++  const navigationAtStart = readerNavigationGeneration;
+   try {
+     const bookId = Number(result.bookId);
+     const chapterIndex = Number(result.chapterIndex);
+     const book = await getBook(bookId);
++    if (navigationAtStart !== readerNavigationGeneration) return;
+     if (!book) {
+       showToast('Tác phẩm chứa kết quả này đã bị xóa.', 'warning');
+       return;
+@@ -2328,7 +2370,6 @@ async function navigateToGlobalSearchResult(resultIndex) {
+     focusNode.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+     focusNode.focus({ preventScroll: true });
+     resetProgressBaselineAtParagraph(focusNode);
+-    noteTrustedKeyboardActivity();
+   } catch {
+     showToast('Không thể mở kết quả tìm kiếm lúc này.', 'warning');
+   } finally {
+@@ -2429,7 +2470,7 @@ function flushPendingScrollProgress() {
+     const scrollY = window.scrollY;
+     const overallProgress = calculateOverallProgress();
+     const currentChunk = state.tts ? (state.tts.currentIndex || 0) : (state.currentBook.currentChunkIndex || 0);
+-    void updateProgress(state.currentBook.id, state.currentChapterIndex, overallProgress, scrollY, currentChunk);
++    void updateProgress(state.currentBook.id, state.currentChapterIndex, overallProgress, scrollY, currentChunk, currentChunkAnchor(currentChunk));
+   }
+ }
+ 
+@@ -2437,8 +2478,10 @@ function flushPendingScrollProgress() {
+  * Opens a book in the reader view.
+  */
+ export async function openBook(bookId, targetChapterIndex = null, options = {}) {
++  const navigationGeneration = ++readerNavigationGeneration;
+   try {
+     const book = await getBook(bookId);
++    if (navigationGeneration !== readerNavigationGeneration) return false;
+     if (!book) {
+       showToast('Không tìm thấy tác phẩm này trong cơ sở dữ liệu.', 'error');
+       return false;
+@@ -2454,9 +2497,12 @@ export async function openBook(bookId, targetChapterIndex = null, options = {})
+       state.tts?.stop();
+       state.autoScroll?.stop();
+       await endReadingHistorySession(Date.now());
++      if (navigationGeneration !== readerNavigationGeneration) return false;
+     }
++    const chaptersMeta = await getBookChaptersMeta(bookId);
++    if (navigationGeneration !== readerNavigationGeneration) return false;
+     state.currentBook = book;
+-    state.chaptersMeta = await getBookChaptersMeta(bookId);
++    state.chaptersMeta = chaptersMeta;
+     DOM.tocBookTitle.textContent = book.title;
+ 
+     // Load per-book TTS customization if saved
+@@ -2500,14 +2546,16 @@ export async function openBook(bookId, targetChapterIndex = null, options = {})
+     DOM.readerView.classList.add('active');
+     window.scrollTo({ top: 0, behavior: 'instant' });
+ 
+-    const useSavedChunk = targetChapterIndex === null || options.preserveChunk === true;
++    const useSavedChunk = (targetChapterIndex === null || options.preserveChunk === true)
++      && Number(chapterIdx) === Number(book.currentChapterIndex || 0);
+     const initialChunk = useSavedChunk ? (book.currentChunkIndex || 0) : 0;
+     const initialScrollY = options.restoreScroll === false
+       ? 0
+       : (targetChapterIndex === null ? book.scrollY : 0);
+-    const loaded = await loadChapter(chapterIdx, initialScrollY, initialChunk);
+-    if (loaded) {
++    const loaded = await loadChapter(chapterIdx, initialScrollY, initialChunk, useSavedChunk ? book.ttsChunkAnchor : null, navigationGeneration);
++    if (loaded && navigationGeneration === readerNavigationGeneration && Number(state.currentBook?.id) === Number(book.id)) {
+       await startReadingHistorySession({ bookId: book.id, chapterIndex: chapterIdx, timestamp: Date.now() });
++      if (navigationGeneration !== readerNavigationGeneration || Number(state.currentBook?.id) !== Number(book.id)) return false;
+       if (!readerProgressRebasePending) recordCurrentEyeReadingProgress({ explicitJump: true });
+       lastReadingActivitySignalAt = Date.now();
+     }
+@@ -2523,15 +2571,21 @@ export async function openBook(bookId, targetChapterIndex = null, options = {})
+ /**
+  * Loads and displays a specific chapter.
+  */
+-async function loadChapter(chapterIndex, initialScrollY = 0, initialChunkIndex = 0) {
++async function loadChapter(chapterIndex, initialScrollY = 0, initialChunkIndex = 0, savedAnchor = null, navigationGeneration = null) {
+   if (!state.currentBook) return false;
++  const navigationToken = navigationGeneration ?? ++readerNavigationGeneration;
++  if (navigationToken !== readerNavigationGeneration) return false;
+ 
+   const totalChapters = state.chaptersMeta.length;
+-  if (chapterIndex < 0 || chapterIndex >= totalChapters) {
++  chapterIndex = Number(chapterIndex);
++  if (!Number.isSafeInteger(chapterIndex) || chapterIndex < 0 || chapterIndex >= totalChapters) {
+     showToast('Không có chương này.', 'warning');
+     return false;
+   }
+ 
++  const bookId = state.currentBook.id;
++  flushTtsProgressSave();
++  flushPendingScrollProgress();
+   const currentGeneration = ++chapterLoadGeneration;
+   if (scrollRestoreTimeout) {
+     clearTimeout(scrollRestoreTimeout);
+@@ -2553,9 +2607,13 @@ async function loadChapter(chapterIndex, initialScrollY = 0, initialChunkIndex =
+   }
+   hideSelectionToolbar();
+ 
++  readerChunkMap = null;
++  logicalProgressMap = null;
++  currentTtsChapterIndex = null;
++  activeProgressTtsChunkIndex = lastCompletedProgressTtsChunkIndex = null;
+   state.currentChapterIndex = chapterIndex;
+-  const chapterData = await getChapter(state.currentBook.id, chapterIndex);
+-  if (currentGeneration !== chapterLoadGeneration) return false;
++  const chapterData = await getChapter(bookId, chapterIndex);
++  if (currentGeneration !== chapterLoadGeneration || navigationToken !== readerNavigationGeneration || Number(state.currentBook?.id) !== Number(bookId)) return false;
+   if (!chapterData) {
+     showToast('Không thể nạp nội dung chương.', 'error');
+     return false;
+@@ -2577,7 +2635,8 @@ async function loadChapter(chapterIndex, initialScrollY = 0, initialChunkIndex =
+   }
+ 
+   // Two-Layer Text Sanitization Pipeline: Global Cleaner + Custom Dictionary Rules
+-  const rules = await getCustomRules(state.currentBook.id);
++  const rules = await getCustomRules(bookId);
++  if (currentGeneration !== chapterLoadGeneration || navigationToken !== readerNavigationGeneration || Number(state.currentBook?.id) !== Number(bookId)) return false;
+   state.customRules = rules;
+   const cleanedContent = cleanChapterText(chapterData.content, {
+     rules,
+@@ -2602,20 +2661,32 @@ async function loadChapter(chapterIndex, initialScrollY = 0, initialChunkIndex =
+ 
+   // Load cleaned text into TTS engine
+   currentTtsChapterIndex = chapterIndex;
+-  state.tts.loadText(cleanedContent);
++  restoringChunkPosition = true;
++  try { state.tts.loadText(cleanedContent, readerChunkMap); }
++  finally { restoringChunkPosition = false; }
++
++  const loadedPlaybackGeneration = state.tts.generationToken;
++  const visualBeforeRestore = window.scrollY;
+ 
+   // Apply saved text highlights to reader
+   await loadAndApplyChapterHighlights();
+-  if (currentGeneration !== chapterLoadGeneration) return false;
++  if (currentGeneration !== chapterLoadGeneration || navigationToken !== readerNavigationGeneration || Number(state.currentBook?.id) !== Number(bookId)) return false;
+   await refreshQuotesHubCount();
+-  if (currentGeneration !== chapterLoadGeneration) return false;
++  if (currentGeneration !== chapterLoadGeneration || navigationToken !== readerNavigationGeneration || Number(state.currentBook?.id) !== Number(bookId)) return false;
+ 
+   // Setup Dock Scrubber & Progress Label
+   const totalChunks = state.tts.chunks.length;
+-  const validChunk = Math.min(Math.max(0, initialChunkIndex), Math.max(0, totalChunks - 1));
++  const restored = resolveSavedChunkIndex(readerChunkMap, initialChunkIndex, savedAnchor, chapterIndex);
++  const userSoughtDuringLoad = state.tts.generationToken !== loadedPlaybackGeneration;
++  const validChunk = userSoughtDuringLoad ? state.tts.currentIndex : restored.index;
++  if (!['exact', 'text-anchor', 'empty'].includes(restored.status) && (Number(initialChunkIndex) !== 0 || savedAnchor)) {
++    showToast('Vị trí TTS được khôi phục gần đúng; dữ liệu cũ không đủ để xác định chính xác câu.', 'info');
++  }
+ 
+-  if (state.tts) {
+-    state.tts.jumpToIndex(validChunk, false);
++  if (state.tts && !userSoughtDuringLoad) {
++    restoringChunkPosition = true;
++    try { state.tts.jumpToIndex(validChunk, false); }
++    finally { restoringChunkPosition = false; }
+   }
+ 
+   if (DOM.dockScrubber) {
+@@ -2645,12 +2716,14 @@ async function loadChapter(chapterIndex, initialScrollY = 0, initialChunkIndex =
+   }
+ 
+   if (validChunk > 0) {
+-    highlightSentenceChunk(validChunk);
++    highlightSentenceChunk(validChunk, { scroll: false });
+     if (state.tts.chunks[validChunk] && DOM.ttsPreviewText) {
+       DOM.ttsPreviewText.textContent = state.tts.chunks[validChunk];
+     }
+   }
+ 
++  const restoredPlaybackGeneration = state.tts.generationToken;
++
+   // Ensure dock or mini fab is visible when reader is loaded
+   if (state.isDockMinimized) {
+     if (DOM.ttsDock) DOM.ttsDock.style.display = 'none';
+@@ -2662,29 +2735,38 @@ async function loadChapter(chapterIndex, initialScrollY = 0, initialChunkIndex =
+ 
+   // Render ToC list
+   renderTocDrawerList();
+-  const bookBookmarks = await refreshBookmarksCount(state.currentBook.id);
++  const bookBookmarks = await refreshBookmarksCount(bookId);
++  if (currentGeneration !== chapterLoadGeneration || navigationToken !== readerNavigationGeneration || Number(state.currentBook?.id) !== Number(bookId)) return false;
+   if (DOM.tabViewBookmarks?.style.display !== 'none') {
+     await renderBookmarkHubList(bookBookmarks);
++    if (currentGeneration !== chapterLoadGeneration || navigationToken !== readerNavigationGeneration || Number(state.currentBook?.id) !== Number(bookId)) return false;
+   }
+ 
+   // Scroll to position
+-  if (initialScrollY > 50) {
++  const userMovedDuringLoad = userSoughtDuringLoad || state.tts.generationToken !== restoredPlaybackGeneration || window.scrollY !== visualBeforeRestore;
++  if (userMovedDuringLoad) initialScrollY = window.scrollY;
++  initialScrollY = Number.isFinite(Number(initialScrollY)) ? Math.max(0, Number(initialScrollY)) : 0;
++  if (!userMovedDuringLoad && initialScrollY > 0) {
+     readerProgressRebasePending = true;
+-    scrollRestoreTimeout = setTimeout(() => {
+-      if (currentGeneration === chapterLoadGeneration) {
++    const restoreTimer = setTimeout(() => {
++      if (scrollRestoreTimeout !== restoreTimer) return;
++      scrollRestoreTimeout = null;
++      if (state.tts.generationToken !== restoredPlaybackGeneration || window.scrollY !== visualBeforeRestore) return;
++      if (currentGeneration === chapterLoadGeneration && navigationToken === readerNavigationGeneration && Number(state.currentBook?.id) === Number(bookId)) {
+         window.scrollTo({ top: initialScrollY, behavior: 'smooth' });
+       }
+       scrollRestoreTimeout = null;
+     }, 150);
+-  } else {
++    scrollRestoreTimeout = restoreTimer;
++  } else if (!userMovedDuringLoad) {
+     window.scrollTo({ top: 0, behavior: 'instant' });
+     readerProgressRebasePending = false;
+     recordCurrentEyeReadingProgress({ explicitJump: true });
+   }
+ 
+   // Update progress in DB
+-  await updateProgress(state.currentBook.id, chapterIndex, calculateOverallProgress(), initialScrollY, validChunk);
+-  if (currentGeneration !== chapterLoadGeneration) return false;
++  await updateProgress(bookId, chapterIndex, calculateOverallProgress(), initialScrollY, state.tts.currentIndex, currentChunkAnchor());
++  if (currentGeneration !== chapterLoadGeneration || navigationToken !== readerNavigationGeneration || Number(state.currentBook?.id) !== Number(bookId)) return false;
+   if (previousChapterIndex !== null && previousChapterIndex !== undefined && Number.isSafeInteger(Number(previousChapterIndex)) && previousChapterIndex !== chapterIndex) {
+     markReadingHistoryChapterLeave(previousChapterIndex, Date.now());
+     markReadingHistoryChapterEnter(chapterIndex, Date.now());
+@@ -2697,25 +2779,20 @@ function buildLogicalProgressMap(totalWords) {
+   const paragraphs = new Map();
+   const chunks = new Map();
+   let cursor = 0;
+-  const renderedParagraphs = DOM.readerBodyContent.querySelectorAll('.reader-paragraph[data-para-index]');
+-  for (const paragraph of renderedParagraphs) {
+-    const paragraphIndex = Number(paragraph.getAttribute('data-para-index'));
+-    if (!Number.isSafeInteger(paragraphIndex) || paragraphIndex < 0) continue;
+-    const paragraphWordCount = countWords(paragraph.textContent || '');
++  for (const paragraph of readerChunkMap?.paragraphs || []) {
++    if (!paragraph.text) continue;
++    const wordStarts = [...paragraph.text.matchAll(/\S+/g)].map(match => match.index);
++    const paragraphWordCount = wordStarts.length;
+     const startWord = cursor;
+-    let chunkCursor = startWord;
+-    for (const element of paragraph.querySelectorAll('.tts-chunk[data-chunk-index]')) {
+-      const chunkIndex = Number(element.getAttribute('data-chunk-index'));
+-      const chunkWords = countWords(element.textContent || '');
+-      if (!Number.isSafeInteger(chunkIndex) || chunkIndex < 0 || chunkWords <= 0) continue;
+-      chunks.set(chunkIndex, { startWord: chunkCursor, endWord: chunkCursor + chunkWords });
+-      chunkCursor += chunkWords;
++    let startCursor = 0;
++    let endCursor = 0;
++    for (const chunk of paragraph.chunks) {
++      while (startCursor < wordStarts.length && wordStarts[startCursor] < chunk.start) startCursor++;
++      while (endCursor < wordStarts.length && wordStarts[endCursor] < chunk.end) endCursor++;
++      chunks.set(chunk.index, { startWord: cursor + startCursor, endWord: cursor + endCursor });
+     }
+-    paragraphs.set(paragraphIndex, {
+-      startWord,
+-      endWord: startWord + paragraphWordCount,
+-      midpointWord: startWord + Math.floor(paragraphWordCount / 2)
+-    });
++    paragraphs.set(paragraph.index, { startWord, endWord: startWord + paragraphWordCount,
++      midpointWord: startWord + Math.floor(paragraphWordCount / 2) });
+     cursor += paragraphWordCount;
+   }
+ 
+@@ -2786,65 +2863,34 @@ function resetProgressBaselineAtParagraph(paragraph) {
+  * Renders chapter paragraphs with span-wrapped TTS sentence chunks.
+  */
+ function renderChapterContent(rawContent) {
+-  if (!rawContent || !rawContent.trim()) {
+-    DOM.readerBodyContent.innerHTML = '<p class="reader-paragraph">Nội dung chương trống.</p>';
+-    return;
+-  }
+-
+-  const paragraphs = rawContent.split(/\n+/);
+-  let chunkGlobalIndex = 0;
++  const mapping = { ...buildChapterChunkMap(rawContent), bookId: state.currentBook?.id,
++    chapterIndex: state.currentChapterIndex, generation: chapterLoadGeneration };
++  readerChunkMap = mapping;
+   let html = '';
+-
+-  for (let pIdx = 0; pIdx < paragraphs.length; pIdx++) {
+-    const para = paragraphs[pIdx];
+-    const trimmed = para.trim();
+-    if (!trimmed) continue;
+-
+-    // Sentence splitting matching TTS logic
+-    const sentenceRegex = /[^.!?…;:\n]+[.!?…;:]*|\S+/g;
+-    const sentences = trimmed.match(sentenceRegex) || [trimmed];
+-
+-    let paraInnerHtml = '';
+-    for (let s of sentences) {
+-      const sentenceText = s.trim();
+-      if (!sentenceText) continue;
+-
+-      if (sentenceText.length > 220) {
+-        const subClauses = sentenceText.split(/,\s+/);
+-        let tempBuf = '';
+-        for (const sub of subClauses) {
+-          if ((tempBuf + sub).length < 180) {
+-            tempBuf += (tempBuf ? ', ' : '') + sub;
+-          } else {
+-            if (tempBuf) {
+-              paraInnerHtml += `<span class="tts-chunk" data-chunk-index="${chunkGlobalIndex++}" title="Nhấp để nghe từ câu này">${escapeHTML(tempBuf.trim())} </span>`;
+-            }
+-            tempBuf = sub;
+-          }
+-        }
+-        if (tempBuf) {
+-          paraInnerHtml += `<span class="tts-chunk" data-chunk-index="${chunkGlobalIndex++}" title="Nhấp để nghe từ câu này">${escapeHTML(tempBuf.trim())} </span>`;
+-        }
+-      } else {
+-        paraInnerHtml += `<span class="tts-chunk" data-chunk-index="${chunkGlobalIndex++}" title="Nhấp để nghe từ câu này">${escapeHTML(sentenceText)} </span>`;
+-      }
++  for (const paragraph of mapping.paragraphs) {
++    if (!paragraph.text) continue;
++    let inner = '';
++    let cursor = 0;
++    for (const chunk of paragraph.chunks) {
++      inner += escapeHTML(paragraph.text.slice(cursor, chunk.start));
++      inner += '<span class="tts-chunk" data-chunk-index="' + chunk.index +
++        '" title="Nhấp để nghe từ câu này">' + escapeHTML(chunk.text) + '</span>';
++      cursor = chunk.end;
+     }
+-
+-    html += `<p class="reader-paragraph" data-para-index="${pIdx}">${paraInnerHtml}</p>`;
++    inner += escapeHTML(paragraph.text.slice(cursor));
++    html += '<p class="reader-paragraph" data-para-index="' + paragraph.index + '">' + inner + '</p>';
+   }
+-
+-  DOM.readerBodyContent.innerHTML = html;
+-
+-  // Add click-to-speak listeners on each sentence
++  DOM.readerBodyContent.innerHTML = html || '<p class="reader-paragraph">Nội dung chương trống.</p>';
+   DOM.readerBodyContent.querySelectorAll('.tts-chunk').forEach(span => {
+     span.addEventListener('click', () => {
+-      const idx = parseInt(span.getAttribute('data-chunk-index'), 10);
+-      if (!isNaN(idx)) {
+-        DOM.ttsDock.style.display = 'flex';
+-        state.tts.jumpToIndex(idx, true);
+-      }
++      if (!isReaderChunkMapCurrent(mapping)) return;
++      const index = Number(span.getAttribute('data-chunk-index'));
++      if (!Number.isSafeInteger(index) || !mapping.chunks[index]) return;
++      DOM.ttsDock.style.display = 'flex';
++      state.tts.jumpToIndex(index, true);
+     });
+   });
++  return mapping;
+ }
+ 
+ /**
+@@ -2852,10 +2898,7 @@ function renderChapterContent(rawContent) {
+  */
+ async function navigateChapter(delta, { activity = true } = {}) {
+   if (!state.currentBook) return;
+-  if (isChapterSwitching) {
+-    console.warn('>>> [VietReader] navigateChapter: Đang chuyển chương, bỏ qua yêu cầu chuyển chương đồng thời.');
+-    return;
+-  }
++  cancelChapterHandoff();
+   const newIndex = state.currentChapterIndex + delta;
+   if (newIndex >= 0 && newIndex < state.chaptersMeta.length) {
+     recordCurrentEyeReadingProgress({ explicitJump: readerProgressRebasePending });
+@@ -2863,7 +2906,6 @@ async function navigateChapter(delta, { activity = true } = {}) {
+     if (delta > 0 && isReadingHistoryChapterNearEnd(state.currentChapterIndex)) {
+       markReadingHistoryChapterCompleted(state.currentChapterIndex, Date.now());
+     }
+-    if (activity) noteTrustedKeyboardActivity();
+     await loadChapter(newIndex, 0);
+   }
+ }
+@@ -2878,17 +2920,18 @@ function handleWindowScroll() {
+ 
+   const targetBookId = state.currentBook?.id;
+   const targetChapterIndex = state.currentChapterIndex;
++  const generation = chapterLoadGeneration;
+ 
+   // Debounced auto-save scrollY to IndexedDB
+   clearTimeout(scrollSaveTimeout);
+   scrollSaveTimeout = setTimeout(() => {
+-    if (state.currentBook && Number(state.currentBook.id) === Number(targetBookId) && Number(state.currentChapterIndex) === Number(targetChapterIndex)) {
++    if (generation === chapterLoadGeneration && isReaderChunkMapCurrent() && state.currentBook && Number(state.currentBook.id) === Number(targetBookId) && Number(state.currentChapterIndex) === Number(targetChapterIndex)) {
+       recordCurrentEyeReadingProgress({ explicitJump: readerProgressRebasePending });
+       readerProgressRebasePending = false;
+       const scrollY = window.scrollY;
+       const overallProgress = calculateOverallProgress();
+       const currentChunk = state.tts ? (state.tts.currentIndex || 0) : (state.currentBook.currentChunkIndex || 0);
+-      updateProgress(state.currentBook.id, state.currentChapterIndex, overallProgress, scrollY, currentChunk);
++      updateProgress(state.currentBook.id, state.currentChapterIndex, overallProgress, scrollY, currentChunk, currentChunkAnchor(currentChunk));
+     }
+   }, 400);
+ }
+@@ -2980,7 +3023,10 @@ function closeTocDrawer() {
+  * Switches back to the library view.
+  */
+ function showLibraryView() {
++  flushTtsProgressSave();
+   flushPendingScrollProgress();
++  readerNavigationGeneration++;
++  chapterLoadGeneration++;
+   if (scrollRestoreTimeout) {
+     clearTimeout(scrollRestoreTimeout);
+     scrollRestoreTimeout = null;
+@@ -4337,14 +4383,17 @@ async function handleDeleteHighlight() {
+  */
+ async function loadAndApplyChapterHighlights() {
+   if (!state.currentBook || state.currentChapterIndex === null) return;
+-
++  const bookId = state.currentBook.id;
++  const chapterIndex = state.currentChapterIndex;
++  const generation = chapterLoadGeneration;
++  const mapping = readerChunkMap;
+   try {
+-    const highlights = await getChapterHighlights(state.currentBook.id, state.currentChapterIndex);
++    const highlights = await getChapterHighlights(bookId, chapterIndex);
++    if (generation !== chapterLoadGeneration || mapping !== readerChunkMap ||
++        Number(state.currentBook?.id) !== Number(bookId) || state.currentChapterIndex !== chapterIndex) return;
+     state.currentHighlights = highlights || [];
+     applyHighlightsToContainer(DOM.readerBodyContent, state.currentHighlights);
+-  } catch (err) {
+-    console.warn('Lỗi nạp highlights chương:', err);
+-  }
++  } catch (err) { console.warn('Lỗi nạp highlights chương:', err); }
+ }
+ 
+ /**
+@@ -4420,8 +4469,10 @@ async function handleBookmarkNavigation(bookmarkId) {
+   }
+   bookmarkNavigationPending = true;
+ 
++  const navigationAtStart = readerNavigationGeneration;
+   try {
+     const bookmark = await getBookmark(bookmarkId);
++    if (navigationAtStart !== readerNavigationGeneration) return;
+     const numericValue = value => (typeof value === 'number'
+       || (typeof value === 'string' && value.trim() !== '')) ? Number(value) : NaN;
+     const bookId = numericValue(bookmark?.bookId);
+@@ -4435,11 +4486,13 @@ async function handleBookmarkNavigation(bookmarkId) {
+     }
+ 
+     const book = await getBook(bookId);
++    if (navigationAtStart !== readerNavigationGeneration) return;
+     if (!book) {
+       showToast('Tác phẩm của bookmark này đã bị xóa.', 'warning');
+       return;
+     }
+     const chapters = await getBookChaptersMeta(bookId);
++    if (navigationAtStart !== readerNavigationGeneration) return;
+     const chapterExists = chapters.some(chapter => Number(chapter.chapterIndex) === chapterIndex);
+     if (!chapterExists) {
+       showToast('Không tìm thấy chương của bookmark này.', 'warning');
+@@ -4486,7 +4539,6 @@ async function handleBookmarkNavigation(bookmarkId) {
+     resolved.paragraph.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+     focusBookmarkParagraph(resolved.paragraph);
+     resetProgressBaselineAtParagraph(resolved.paragraph);
+-    noteTrustedKeyboardActivity();
+   } catch (error) {
+     console.warn('Bookmark navigation failed:', error);
+     showToast('Không thể mở bookmark lúc này.', 'warning');
+@@ -5020,34 +5072,47 @@ async function handleImportRulesJSON(e) {
+  */
+ async function reloadCurrentChapterText() {
+   if (!state.currentBook || !state.currentChapter) return;
++  const reloadGeneration = ++readerTextReloadGeneration;
++  const navigationGeneration = readerNavigationGeneration;
++  const bookId = state.currentBook.id;
++  const chapterIndex = state.currentChapterIndex;
++  const generation = chapterLoadGeneration;
++  const sourceChapter = state.currentChapter;
+ 
+   try {
+-    const currentScrollY = window.scrollY;
+-
+-    // Fetch refreshed rules
+-    const rules = await getCustomRules(state.currentBook.id);
++    const rules = await getCustomRules(bookId);
++    if (reloadGeneration !== readerTextReloadGeneration || navigationGeneration !== readerNavigationGeneration || generation !== chapterLoadGeneration || Number(state.currentBook?.id) !== Number(bookId) || sourceChapter !== state.currentChapter) return;
++    const scrollY = window.scrollY;
++    const index = state.tts.currentIndex;
++    const anchor = currentChunkAnchor(index);
++    flushTtsProgressSave();
++    state.tts.stop();
+     state.customRules = rules;
+-
+-    const cleanedContent = cleanChapterText(state.currentChapter.content, {
+-      rules,
+-      enableCleaner: state.enableGlobalCleaner
+-    });
+-
+-    // Re-render DOM
++    const cleanedContent = cleanChapterText(sourceChapter.content, { rules, enableCleaner: state.enableGlobalCleaner });
+     renderChapterContent(cleanedContent);
+-
+-    // Re-load text into TTS engine
+-    state.tts.loadText(cleanedContent);
+-
+-    // Re-apply highlights
++    restoringChunkPosition = true;
++    try { state.tts.loadText(cleanedContent, readerChunkMap); }
++    finally { restoringChunkPosition = false; }
++    currentTtsChapterIndex = chapterIndex;
++    logicalProgressMap = buildLogicalProgressMap(countWords(cleanedContent));
++    activeProgressTtsChunkIndex = lastCompletedProgressTtsChunkIndex = null;
++    const restored = resolveSavedChunkIndex(readerChunkMap, index, anchor, chapterIndex);
++    restoringChunkPosition = true;
++    try { state.tts.jumpToIndex(restored.index, false); }
++    finally { restoringChunkPosition = false; }
++    if (DOM.dockScrubber) {
++      DOM.dockScrubber.max = Math.max(0, state.tts.chunks.length - 1);
++      DOM.dockScrubber.value = restored.index;
++    }
++    if (anchor && !['exact', 'text-anchor', 'empty'].includes(restored.status)) {
++      showToast('Văn bản đã thay đổi; vị trí TTS được giữ gần đúng.', 'info');
++    }
++    const mapping = readerChunkMap;
++    window.scrollTo({ top: scrollY, behavior: 'instant' });
+     await loadAndApplyChapterHighlights();
+-
+-    // Preserve scroll position
+-    window.scrollTo({ top: currentScrollY, behavior: 'instant' });
+-
+-  } catch (err) {
+-    console.error('Lỗi nạp lại văn bản đã lọc:', err);
+-  }
++    if (generation !== chapterLoadGeneration || mapping !== readerChunkMap || Number(state.currentBook?.id) !== Number(bookId)) return;
++    await updateProgress(bookId, chapterIndex, calculateOverallProgress(), window.scrollY, state.tts.currentIndex, currentChunkAnchor());
++  } catch (err) { console.error('Lỗi nạp lại văn bản đã lọc:', err); }
+ }
+ 
+ // ============================================================================
+@@ -5426,6 +5491,7 @@ function initMediaSession() {
+   }
+   state.mediaSession = new MediaSessionHelper({
+     onPlay: () => {
++      if (!isReaderChunkMapCurrent()) return;
+       if (state.tts && !state.tts.isPlaying) {
+         if (state.tts.isPaused) {
+           state.tts.resume();
+@@ -5440,6 +5506,7 @@ function initMediaSession() {
+       }
+     },
+     onPrevTrack: () => {
++      if (!isReaderChunkMapCurrent()) return;
+       if (state.tts && state.tts.currentIndex > 0) {
+         state.tts.prev();
+       } else if (state.currentChapterIndex > 0) {
+@@ -5447,6 +5514,7 @@ function initMediaSession() {
+       }
+     },
+     onNextTrack: () => {
++      if (!isReaderChunkMapCurrent()) return;
+       if (state.tts && state.tts.currentIndex < state.tts.chunks.length - 1) {
+         state.tts.next();
+       } else if (state.currentChapterIndex < state.chaptersMeta.length - 1) {
+@@ -5454,12 +5522,14 @@ function initMediaSession() {
+       }
+     },
+     onSeekBackward: (offset) => {
++      if (!isReaderChunkMapCurrent()) return;
+       if (state.tts) {
+         const target = Math.max(0, state.tts.currentIndex - 2);
+         state.tts.jumpToIndex(target, state.tts.isPlaying);
+       }
+     },
+     onSeekForward: (offset) => {
++      if (!isReaderChunkMapCurrent()) return;
+       if (state.tts) {
+         const target = Math.min(state.tts.chunks.length - 1, state.tts.currentIndex + 2);
+         state.tts.jumpToIndex(target, state.tts.isPlaying);

@@ -1,0 +1,8 @@
+﻿node_modules/
+dist/
+build/
+.next/
+out/
+.env
+.env*.local
+.ag-kernel.json

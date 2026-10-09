@@ -1,0 +1,1396 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VietReader - Ứng Dụng Đọc & Nghe Truyện Tiếng Việt</title>
+  <meta name="description" content="Trình đọc truyện cá nhân offline hiện đại, tối ưu trải nghiệm đọc sách và Text-to-Speech tiếng Việt với bộ chia chương thông minh.">
+
+  <!-- Google Fonts: Inter, Merriweather, Be Vietnam Pro -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=Inter:wght@300;400;500;600;700;800&family=Merriweather:ital,wght@0,300;0,400;0,700;1,300;1,400&display=swap" rel="stylesheet">
+
+  <!-- External High Performance Libraries -->
+  <!-- Dexie.js for IndexedDB -->
+  <script src="https://cdn.jsdelivr.net/npm/dexie@3.2.4/dist/dexie.min.js"></script>
+  <!-- JSZip for EPUB decompression -->
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <!-- PDF.js for PDF text extraction -->
+  <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+
+  <!-- Application Styles -->
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body class="theme-light">
+
+  <!-- Top Reading Progress Bar (Fixed across very top of browser) -->
+  <div id="top-reading-progress" class="top-reading-progress">
+    <div id="top-progress-inner" class="top-reading-progress-inner"></div>
+  </div>
+
+  <!-- Main Navigation Header -->
+  <header class="app-header">
+    <div class="brand-container" id="btn-brand-home" title="Về Kệ Sách">
+      <div class="brand-icon">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"/>
+          <path d="M6 6h10"/>
+          <path d="M6 10h10"/>
+        </svg>
+      </div>
+      <span class="brand-title">VietReader</span>
+    </div>
+
+    <div class="header-actions">
+      <!-- Quick Paste Raw Text Button -->
+      <button id="btn-open-paste" class="btn-secondary" title="Dán văn bản thô trực tiếp">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>
+          <rect x="8" y="2" width="8" height="4" rx="1" ry="1"/>
+        </svg>
+        <span>Dán văn bản</span>
+      </button>
+
+      <!-- Backup / Restore Button -->
+      <button id="btn-backup-menu" class="btn-secondary" title="Sao lưu hoặc Khôi phục dữ liệu">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/>
+          <line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+        <span>Sao lưu</span>
+      </button>
+
+      <!-- Global Theme Quick Toggle -->
+      <button id="btn-quick-theme" class="btn-icon" title="Đổi giao diện Sáng / Tối">
+        <svg id="theme-toggle-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="5"/>
+          <line x1="12" y1="1" x2="12" y2="3"/>
+          <line x1="12" y1="21" x2="12" y2="23"/>
+          <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+          <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+          <line x1="1" y1="12" x2="3" y2="12"/>
+          <line x1="21" y1="12" x2="23" y2="12"/>
+          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+          <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ======================================================================
+       VIEW 1: LIBRARY DASHBOARD
+       ====================================================================== -->
+  <main id="library-view" class="view-container active">
+    <!-- Hero / Intro -->
+    <section class="library-hero">
+      <div class="hero-header">
+        <div class="hero-title">
+          <h1>Kệ Sách Của Bạn</h1>
+          <p>Lưu trữ không giới hạn trên trình duyệt. Tự động ghi nhớ trang đọc và hỗ trợ đọc bằng giọng nói tiếng Việt.</p>
+        </div>
+        <div class="library-view-actions">
+          <button id="btn-open-analytics" class="btn-secondary history-entry" type="button" aria-label="Mở thống kê cá nhân">
+            <span aria-hidden="true">📊</span><span>Thống kê</span>
+          </button>
+          <button id="btn-open-history" class="btn-secondary history-entry" type="button" aria-label="Mở lịch sử đọc">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/><path d="M3 12a9 9 0 0 1 2.6-6.4L3 3"/>
+            </svg>
+            <span>Lịch sử đọc</span>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- File Dropzone -->
+    <section class="upload-dropzone">
+      <div id="dropzone" class="dropzone-box">
+        <input type="file" id="file-input" accept=".txt,.pdf,.epub" style="display: none;" multiple>
+        <div class="dropzone-icon">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+        </div>
+        <div class="dropzone-text">
+          <h3>Kéo & thả file truyện vào đây hoặc nhấn để chọn file</h3>
+          <p>Hỗ trợ định dạng sách phổ biến: .TXT, .PDF, .EPUB (Phân tích tự động 100% offline)</p>
+        </div>
+        <div class="badge-row">
+          <span class="pill-badge">.TXT</span>
+          <span class="pill-badge">.PDF</span>
+          <span class="pill-badge">.EPUB</span>
+          <span class="pill-badge">Tự động chia chương</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Books Grid -->
+    <section class="books-section">
+      <div class="section-title-row">
+        <h2 class="section-title">Danh sách tác phẩm (<span id="books-count">0</span>)</h2>
+        <div id="library-filter-container" class="library-search-actions">
+          <button id="btn-global-search" class="btn-secondary global-search-entry" type="button" aria-label="Tìm trong thư viện">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>
+            </svg>
+            <span>Tìm trong thư viện</span>
+          </button>
+          <input type="text" id="library-search-input" placeholder="Tìm tên sách hoặc tác giả..." class="form-input library-title-search" aria-label="Lọc tên sách hoặc tác giả">
+        </div>
+      </div>
+
+      <div id="books-grid" class="books-grid">
+        <!-- Rendered dynamically via app.js -->
+      </div>
+
+      <!-- Empty State Container -->
+      <div id="empty-library" class="empty-library" style="display: none;">
+        <div class="empty-icon">
+          <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
+            <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>
+          </svg>
+        </div>
+        <h3>Chưa có tác phẩm nào trên kệ</h3>
+        <p>Kéo thả file sách (.txt, .pdf, .epub) hoặc bấm nút dán văn bản để bắt đầu trải nghiệm đọc truyện tuyệt vời.</p>
+        <button id="btn-load-sample" class="btn-primary">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+          <span>Nạp truyện mẫu tiếng Việt</span>
+        </button>
+      </div>
+    </section>
+  </main>
+
+  <!-- Reading History is a separate Library view; it never occupies the Reader. -->
+  <main id="history-view" class="view-container history-view" aria-labelledby="history-title" hidden>
+    <section class="history-shell">
+      <header class="history-header">
+        <div class="history-heading">
+          <button id="btn-back-history" class="history-back" type="button">
+            <span aria-hidden="true">←</span> Kệ sách
+          </button>
+          <h1 id="history-title" tabindex="-1">Lịch sử đọc</h1>
+          <p>Thời gian đọc và nghe được tính trong tổng thời gian hoạt động.</p>
+        </div>
+        <button id="btn-clear-history" class="btn-secondary history-clear" type="button" hidden>
+          Xóa toàn bộ lịch sử
+        </button>
+      </header>
+
+      <nav class="history-periods" aria-label="Khoảng thời gian lịch sử">
+        <div role="group" aria-label="Lọc thống kê theo khoảng thời gian">
+          <button class="history-period-btn" type="button" data-history-period="today" aria-pressed="true">Hôm nay</button>
+          <button class="history-period-btn" type="button" data-history-period="7days" aria-pressed="false">7 ngày</button>
+          <button class="history-period-btn" type="button" data-history-period="30days" aria-pressed="false">30 ngày</button>
+        </div>
+      </nav>
+
+      <p id="history-loading" class="history-loading" role="status" hidden>Đang tải lịch sử…</p>
+      <p id="history-status" class="sr-only" role="status" aria-live="polite"></p>
+
+      <section id="history-dashboard" class="history-dashboard" aria-labelledby="history-dashboard-title" hidden>
+        <div class="history-section-heading">
+          <h2 id="history-dashboard-title">Tổng quan</h2>
+          <p id="history-range-caption"></p>
+        </div>
+        <dl id="history-metrics" class="history-metrics"></dl>
+        <p class="history-metric-note">Thời gian nghe TTS nằm trong tổng thời gian đọc / nghe chủ động.</p>
+      </section>
+
+      <section id="history-empty" class="history-empty" aria-labelledby="history-empty-title" hidden>
+        <div class="history-empty-mark" aria-hidden="true">◷</div>
+        <h2 id="history-empty-title">Chưa có lịch sử đọc</h2>
+        <p>Bắt đầu mở một cuốn sách và VietReader sẽ ghi lại hành trình đọc của bạn tại đây.</p>
+      </section>
+
+      <section id="history-timeline" class="history-timeline" aria-labelledby="history-timeline-title" hidden>
+        <div class="history-section-heading">
+          <h2 id="history-timeline-title" tabindex="-1">Các phiên đọc</h2>
+        </div>
+        <div id="history-groups" class="history-groups" aria-live="polite"></div>
+        <button id="btn-history-load-more" class="btn-secondary history-load-more" type="button" hidden>Tải thêm phiên</button>
+      </section>
+    </section>
+  </main>
+
+  <!-- Personal Analytics is a separate Library view and reads only History-derived data. -->
+  <main id="analytics-view" class="view-container analytics-view" aria-labelledby="analytics-title" hidden>
+    <div class="analytics-shell">
+      <header class="analytics-header">
+        <div class="analytics-heading">
+          <button id="btn-back-analytics" class="history-back" type="button"><span aria-hidden="true">←</span> Kệ sách</button>
+          <h1 id="analytics-title" tabindex="-1">Thống kê cá nhân</h1>
+          <p>Nhìn lại thời gian bạn dành cho việc đọc và nghe.</p>
+        </div>
+      </header>
+
+      <nav class="analytics-ranges" aria-label="Khoảng thời gian thống kê">
+        <div role="group" aria-label="Chọn khoảng thời gian">
+          <button class="analytics-range-btn" type="button" data-analytics-range="7days" aria-pressed="true">7 ngày</button>
+          <button class="analytics-range-btn" type="button" data-analytics-range="30days" aria-pressed="false">30 ngày</button>
+          <button class="analytics-range-btn" type="button" data-analytics-range="365days" aria-pressed="false">365 ngày</button>
+          <button class="analytics-range-btn" type="button" data-analytics-range="allTime" aria-pressed="false">Toàn bộ</button>
+        </div>
+      </nav>
+      <p id="analytics-loading" class="history-loading" role="status" hidden>Đang tải thống kê…</p>
+      <p id="analytics-status" class="sr-only" role="status" aria-live="polite"></p>
+      <section id="analytics-empty" class="history-empty" aria-labelledby="analytics-empty-title" hidden>
+        <div class="history-empty-mark" aria-hidden="true">◷</div>
+        <h2 id="analytics-empty-title">Chưa đủ dữ liệu thống kê</h2>
+        <p>Hãy đọc hoặc nghe một vài phiên, VietReader sẽ bắt đầu xây dựng thống kê cá nhân cho bạn.</p>
+      </section>
+
+      <div id="analytics-content" class="analytics-content" hidden>
+        <section class="analytics-section" aria-labelledby="analytics-overview-title">
+          <div class="analytics-section-heading">
+            <div><h2 id="analytics-overview-title">Tổng quan</h2><p id="analytics-range-caption"></p></div>
+          </div>
+          <dl id="analytics-kpis" class="analytics-kpis"></dl>
+          <dl id="analytics-secondary" class="analytics-secondary"></dl>
+          <p class="analytics-note">Thời gian TTS nằm trong tổng thời gian hoạt động; từ là số ước tính.</p>
+        </section>
+
+        <section class="analytics-section analytics-trends" aria-labelledby="analytics-trend-title">
+          <div class="analytics-section-heading"><div><h2 id="analytics-trend-title">Nhịp đọc</h2><p>Thời gian hoạt động theo ngày</p></div></div>
+          <div class="analytics-chart-grid">
+            <article class="analytics-panel"><h3>7 ngày gần nhất</h3><div id="analytics-week-chart"></div></article>
+            <article class="analytics-panel"><h3>30 ngày gần nhất</h3><div id="analytics-month-chart"></div><div id="analytics-comparison" class="analytics-comparison"></div></article>
+          </div>
+        </section>
+
+        <section class="analytics-section" aria-labelledby="analytics-heatmap-title">
+          <div class="analytics-section-heading"><div><h2 id="analytics-heatmap-title">Lịch đọc trong năm</h2><p>Mỗi ô là một ngày theo lịch địa phương.</p></div></div>
+          <div id="analytics-heatmap-description" class="sr-only">Màu đậm hơn biểu thị thời gian đọc chủ động nhiều hơn; mỗi ngày có mô tả bằng chữ.</div>
+          <div class="analytics-heatmap-scroll" tabindex="0" role="region" aria-label="Heatmap hoạt động đọc 365 ngày" aria-describedby="analytics-heatmap-description">
+            <div id="analytics-heatmap" class="analytics-heatmap"></div>
+          </div>
+          <div class="analytics-heatmap-legend" aria-label="Thang thời lượng hoạt động">
+            <span>Ít</span><i class="activity-cell level-0" aria-hidden="true"></i><i class="activity-cell level-1" aria-hidden="true"></i><i class="activity-cell level-2" aria-hidden="true"></i><i class="activity-cell level-3" aria-hidden="true"></i><i class="activity-cell level-4" aria-hidden="true"></i><span>Nhiều</span>
+          </div>
+        </section>
+
+        <section class="analytics-section" aria-labelledby="analytics-habits-title">
+          <div class="analytics-section-heading"><div><h2 id="analytics-habits-title">Thói quen đọc</h2><p>Những nhịp điệu nổi bật trong khoảng đã chọn.</p></div></div>
+          <dl id="analytics-habits" class="analytics-habits"></dl>
+        </section>
+
+        <section class="analytics-section" aria-labelledby="analytics-books-title">
+          <div class="analytics-section-heading"><div><h2 id="analytics-books-title">Truyện bạn đọc nhiều</h2><p>Xếp theo thời gian hoạt động.</p></div></div>
+          <ol id="analytics-top-books" class="analytics-top-books"></ol>
+        </section>
+
+        <section class="analytics-section analytics-lifetime" aria-labelledby="analytics-lifetime-title">
+          <div class="analytics-section-heading"><div><h2 id="analytics-lifetime-title">Từ khi sử dụng VietReader</h2><p>Tổng hợp không phụ thuộc khoảng thời gian phía trên.</p></div></div>
+          <dl id="analytics-lifetime-metrics" class="analytics-lifetime-metrics"></dl>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <!-- ======================================================================
+       MODAL: GLOBAL FULL-TEXT SEARCH
+       ====================================================================== -->
+  <div id="global-search-modal" class="modal-overlay global-search-overlay" aria-hidden="true">
+    <section class="modal-dialog global-search-dialog" role="dialog" aria-modal="true" aria-labelledby="global-search-title" aria-describedby="global-search-help" tabindex="-1">
+      <header class="global-search-header">
+        <div>
+          <h2 id="global-search-title">Tìm trong thư viện</h2>
+          <p id="global-search-help">Tìm từ hoặc cụm từ trong nội dung các chương.</p>
+        </div>
+        <button id="btn-close-global-search" class="btn-icon" type="button" aria-label="Đóng tìm kiếm" title="Đóng tìm kiếm (Esc)">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+            <path d="m18 6-12 12M6 6l12 12"/>
+          </svg>
+        </button>
+      </header>
+      <form id="global-search-form" class="global-search-form" role="search">
+        <label class="sr-only" for="global-search-input">Từ hoặc cụm từ cần tìm</label>
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>
+        </svg>
+        <input id="global-search-input" type="search" autocomplete="off" spellcheck="false" placeholder="Ví dụ: kiếm hiệp, trường sinh…" aria-label="Tìm nội dung trong thư viện" aria-controls="global-search-results">
+        <button id="btn-clear-global-search" class="global-search-clear" type="button" aria-label="Xóa nội dung tìm kiếm" title="Xóa tìm kiếm">Xóa</button>
+      </form>
+      <p id="global-search-status" class="global-search-status" role="status" aria-live="polite"></p>
+      <div id="global-search-results" class="global-search-results" role="region" aria-label="Kết quả tìm kiếm" aria-busy="false" tabindex="-1">
+        <div id="global-search-results-list" class="global-search-results-list"></div>
+      </div>
+      <button id="btn-global-search-more" class="btn-secondary global-search-more" type="button" hidden>Xem thêm kết quả</button>
+    </section>
+  </div>
+
+  <!-- ======================================================================
+       VIEW 2: DEDICATED READER VIEW
+       ====================================================================== -->
+  <main id="reader-view" class="view-container">
+    <!-- Reader Sub Header Controls -->
+    <div class="reader-sub-header">
+      <div class="reader-header-left">
+        <button id="btn-back-library" class="btn-icon" title="Quay lại Kệ Sách">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="m15 18-6-6 6-6"/>
+          </svg>
+        </button>
+        <button id="btn-toggle-toc" class="btn-icon" title="Mục lục các chương">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="8" y1="6" x2="21" y2="6"/>
+            <line x1="8" y1="12" x2="21" y2="12"/>
+            <line x1="8" y1="18" x2="21" y2="18"/>
+            <line x1="3" y1="6" x2="3.01" y2="6"/>
+            <line x1="3" y1="12" x2="3.01" y2="12"/>
+            <line x1="3" y1="18" x2="3.01" y2="18"/>
+          </svg>
+        </button>
+        <div class="reader-chapter-info" id="reader-nav-title">Chương 1</div>
+      </div>
+
+      <div class="reader-header-right">
+        <span class="reading-progress-pill" id="reading-percentage-badge">0%</span>
+        
+        <!-- Prev / Next Chapter Buttons -->
+        <button id="btn-prev-chapter-nav" class="btn-icon" title="Chương trước">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="15 18 9 12 15 6"/>
+          </svg>
+        </button>
+        <button id="btn-next-chapter-nav" class="btn-icon" title="Chương kế tiếp">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="9 18 15 12 9 6"/>
+          </svg>
+        </button>
+
+        <!-- TTS Toggle Button -->
+        <button id="btn-toggle-tts-dock" class="btn-icon" title="Mở bảng đọc giọng nói TTS">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+            <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+            <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+          </svg>
+        </button>
+
+        <!-- Quotes & Highlights Hub Button -->
+        <button id="btn-open-quotes" class="btn-icon" title="Trích dẫn & Ghi chú đã lưu">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
+          </svg>
+        </button>
+
+        <!-- Dictionary & Text Cleaner Button (Text Engine Pro) -->
+        <button id="btn-open-dict" class="btn-icon" title="Bộ lọc & Từ điển thay thế (Text Engine Pro)">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
+          </svg>
+        </button>
+
+        <!-- Typography Settings Modal Button -->
+        <button id="btn-open-settings" class="btn-icon" title="Tùy biến hiển thị & cỡ chữ">
+          <span style="font-weight: 800; font-size: 1.05rem;">Aa</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Reading Content Area -->
+    <article class="reader-container" id="reader-container">
+      <header class="chapter-header">
+        <h1 class="chapter-title-main" id="reader-chapter-title">Chương 1</h1>
+        <div class="chapter-meta-tag" id="reader-chapter-meta">Khoảng 1.200 từ · Ước tính 5 phút đọc</div>
+      </header>
+
+      <!-- Paragraphs and TTS Chunk Spans are injected here -->
+      <div id="reader-body-content">
+        <!-- Content -->
+      </div>
+
+      <!-- Bottom Chapter Navigation -->
+      <div class="reader-bottom-nav">
+        <button id="btn-bottom-prev-ch" class="btn-secondary">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="15 18 9 12 15 6"/>
+          </svg>
+          <span>Chương trước</span>
+        </button>
+        <button id="btn-bottom-next-ch" class="btn-primary">
+          <span>Chương tiếp theo</span>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="9 18 15 12 9 6"/>
+          </svg>
+        </button>
+      </div>
+    </article>
+  </main>
+
+  <!-- ======================================================================
+       DRAWER: TABLE OF CONTENTS (MỤC LỤC)
+       ====================================================================== -->
+  <div id="toc-drawer-backdrop" class="drawer-backdrop">
+    <aside class="drawer-panel">
+      <div class="drawer-header">
+        <h3 id="toc-book-title">Mục lục tác phẩm</h3>
+        <button id="btn-close-toc" class="btn-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Drawer Tabs: Mục lục, Trích dẫn, Bookmark -->
+      <div class="drawer-tabs" role="tablist" aria-label="Nội dung Reader">
+        <button id="tab-btn-toc" class="drawer-tab-btn active" type="button" role="tab" aria-selected="true" aria-controls="tab-view-toc">
+          📑 Mục lục (<span id="toc-chapters-count">0</span>)
+        </button>
+        <button id="tab-btn-quotes" class="drawer-tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-view-quotes" tabindex="-1">
+          ✍️ Trích dẫn (<span id="quotes-count-badge">0</span>)
+        </button>
+        <button id="tab-btn-bookmarks" class="drawer-tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-view-bookmarks" tabindex="-1">
+          🔖 Bookmark (<span id="bookmarks-count-badge">0</span>)
+        </button>
+      </div>
+
+      <!-- TAB 1: Chapters List -->
+      <div id="tab-view-toc" class="drawer-tab-view active" role="tabpanel" aria-labelledby="tab-btn-toc">
+        <div class="drawer-search">
+          <div class="search-input-wrapper">
+            <svg class="search-icon-fixed" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="11" cy="11" r="8"/>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+            </svg>
+            <input type="text" id="toc-search-input" placeholder="Tìm kiếm chương...">
+          </div>
+        </div>
+        <div class="drawer-content" id="toc-chapters-list">
+          <!-- Rendered dynamically -->
+        </div>
+      </div>
+
+      <!-- TAB 2: Quotes & Highlights Hub -->
+      <div id="tab-view-quotes" class="drawer-tab-view" role="tabpanel" aria-labelledby="tab-btn-quotes" style="display: none;">
+        <div class="quotes-hub-header">
+          <span>Trích dẫn & Ghi chú</span>
+          <button id="btn-export-quotes-md" class="btn-secondary btn-mini" title="Xuất toàn bộ trích dẫn ra Markdown cho Obsidian / Notion">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            <span>Xuất Markdown</span>
+          </button>
+        </div>
+        <div class="drawer-content quotes-hub-list" id="quotes-cards-list">
+          <!-- Rendered dynamically -->
+        </div>
+        <div id="empty-quotes-state" class="empty-quotes-state" style="display: none;">
+          <div style="font-size: 1.5rem; margin-bottom: 0.5rem;">✍️</div>
+          <p style="font-weight: 600; margin-bottom: 0.35rem;">Chưa có trích dẫn nào</p>
+          <small style="color: var(--text-muted); line-height: 1.5; display: block;">
+            Bôi đen một đoạn văn bất kỳ trong trang đọc để chọn màu đánh dấu và thêm ghi chú suy nghĩ cá nhân.
+          </small>
+        </div>
+      </div>
+
+      <!-- TAB 3: Reading Bookmarks -->
+      <div id="tab-view-bookmarks" class="drawer-tab-view" role="tabpanel" aria-labelledby="tab-btn-bookmarks" style="display: none;">
+        <div class="bookmarks-hub-header">
+          <span>Vị trí đọc đã lưu</span>
+        </div>
+        <div class="drawer-content bookmarks-hub-list" id="bookmarks-cards-list"></div>
+        <div id="empty-bookmarks-state" class="empty-bookmarks-state" style="display: none;">
+          <div class="empty-bookmarks-icon" aria-hidden="true">🔖</div>
+          <p>Chưa có bookmark</p>
+          <small>Khi đang đọc, nhấn 🔖 để lưu nhanh vị trí và quay lại sau.</small>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- ======================================================================
+       FLOATING SETTINGS MODAL (Aa)
+       ====================================================================== -->
+  <div id="settings-modal" class="settings-modal-backdrop">
+    <div class="settings-card">
+      <div class="modal-header">
+        <h3>Tùy biến hiển thị & Đọc sách</h3>
+        <button id="btn-close-settings" class="btn-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Theme Selector -->
+      <div class="setting-group">
+        <div class="setting-label">Giao diện màu sắc</div>
+        <div class="theme-swatches">
+          <button class="theme-swatch-btn swatch-light" data-theme="theme-light">
+            <span>Sáng</span>
+            <small>Paper White</small>
+          </button>
+          <button class="theme-swatch-btn swatch-dark" data-theme="theme-dark">
+            <span>Tối</span>
+            <small>OLED Dark</small>
+          </button>
+          <button class="theme-swatch-btn swatch-sepia" data-theme="theme-sepia">
+            <span>Vàng ấm</span>
+            <small>Sepia</small>
+          </button>
+          <button class="theme-swatch-btn swatch-navy" data-theme="theme-navy">
+            <span>Xanh đêm</span>
+            <small>Navy</small>
+          </button>
+        </div>
+      </div>
+
+      <!-- Font Family -->
+      <div class="setting-group">
+        <div class="setting-label">Font chữ</div>
+        <div class="font-chips">
+          <button class="font-chip-btn" data-font="'Inter', sans-serif">Inter</button>
+          <button class="font-chip-btn" data-font="'Merriweather', serif">Merriweather</button>
+          <button class="font-chip-btn" data-font="'Be Vietnam Pro', sans-serif">Be Vietnam</button>
+        </div>
+      </div>
+
+      <!-- Font Size Slider -->
+      <div class="setting-group">
+        <div class="setting-label">
+          <span>Cỡ chữ</span>
+          <span id="label-font-size">19px</span>
+        </div>
+        <input type="range" id="slider-font-size" min="14" max="28" step="1" value="19" class="slider-control">
+      </div>
+
+      <!-- Line Height Slider -->
+      <div class="setting-group">
+        <div class="setting-label">
+          <span>Khoảng cách dòng</span>
+          <span id="label-line-height">1.8</span>
+        </div>
+        <input type="range" id="slider-line-height" min="1.4" max="2.2" step="0.1" value="1.8" class="slider-control">
+      </div>
+
+      <!-- Max Width Slider -->
+      <div class="setting-group">
+        <div class="setting-label">
+          <span>Độ rộng khung đọc</span>
+          <span id="label-max-width">820px</span>
+        </div>
+        <input type="range" id="slider-max-width" min="600" max="1100" step="20" value="820" class="slider-control">
+      </div>
+
+      <!-- Text Alignment -->
+      <div class="setting-group">
+        <div class="setting-label">Căn lề đoạn văn</div>
+        <div style="display: flex; gap: 0.5rem;">
+          <button id="btn-align-justify" class="btn-secondary" style="flex: 1;">Căn đều (Justify)</button>
+          <button id="btn-align-left" class="btn-secondary" style="flex: 1;">Căn trái (Left)</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       ADVANCED FLOATING READER DOCK (Capsule Style)
+       ====================================================================== -->
+  <aside id="tts-dock" class="reader-dock" style="display: none;" role="region" aria-label="Thanh điều khiển đọc truyện">
+    <!-- Top Row: Navigation Progress & Interactive Scrub Bar -->
+    <div class="dock-top-row">
+      <!-- Chapter navigation & Progress Label -->
+      <div class="dock-meta-group">
+        <button id="btn-dock-prev-ch" class="btn-dock-icon" title="Chương trước ([)">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="19 20 9 12 19 4 19 20"/>
+            <line x1="5" y1="19" x2="5" y2="5"/>
+          </svg>
+        </button>
+        <div class="dock-progress-info" id="dock-progress-label" title="Tiến độ đoạn văn trong chương">
+          Chương 1 · Đoạn 0/0 (0%)
+        </div>
+        <button id="btn-dock-next-ch" class="btn-dock-icon" title="Chương sau (])">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="5 4 15 12 5 20 5 4"/>
+            <line x1="19" y1="5" x2="19" y2="19"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Interactive Scrubber -->
+      <div class="dock-scrubber-container">
+        <input type="range" id="dock-scrubber" min="0" max="0" value="0" step="1" class="dock-scrubber-slider" title="Kéo để nhảy đến đoạn mong muốn">
+      </div>
+
+      <!-- Minimize Button (-) -->
+      <button id="btn-dock-minimize" class="btn-dock-icon btn-dock-minimize" title="Thu nhỏ thanh điều khiển (-)">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Sentence Preview Text -->
+    <div class="dock-preview-row">
+      <div class="dock-sentence-preview" id="tts-preview-text">
+        Nhấn phát hoặc click vào câu bất kỳ trong trang để bắt đầu nghe...
+      </div>
+    </div>
+
+    <!-- Bottom Row: 3 Control Clusters -->
+    <div class="dock-controls-row">
+      <!-- CỤM 1: CỤM TTS PHÁT ÂM (AUDIO & SPEECH MASTER) -->
+      <div class="dock-cluster dock-cluster-audio">
+        <!-- Tua lùi 1 đoạn -->
+        <button id="btn-tts-prev" class="btn-dock-icon" title="Lùi 1 đoạn (Mũi tên Trái)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="11 19 2 12 11 5 11 19"/>
+            <polygon points="22 19 13 12 22 5 22 19"/>
+          </svg>
+        </button>
+
+        <!-- Hero Play/Pause Toggle -->
+        <button id="btn-tts-play-toggle" class="btn-hero-play" title="Phát / Tạm dừng (Space)">
+          <svg id="tts-play-icon" width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+        </button>
+
+        <!-- Tua tới 1 đoạn -->
+        <button id="btn-tts-next" class="btn-dock-icon" title="Tiến 1 đoạn (Mũi tên Phải)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="13 19 22 12 13 5 13 19"/>
+            <polygon points="2 19 11 12 2 5 2 19"/>
+          </svg>
+        </button>
+
+        <!-- Dừng hẳn -->
+        <button id="btn-tts-stop" class="btn-dock-icon" title="Dừng hẳn">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+            <rect x="6" y="6" width="12" height="12" rx="2"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- CỤM 2: CẤU HÌNH GIỌNG & TỐC ĐỘ (VOICE & SPEED PRESETS) -->
+      <div class="dock-cluster dock-cluster-voice">
+        <!-- Voice selector dropdown -->
+        <div class="dock-select-wrapper" title="Chọn giọng đọc">
+          <svg class="dock-select-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+            <line x1="12" y1="19" x2="12" y2="23"/>
+            <line x1="8" y1="23" x2="16" y2="23"/>
+          </svg>
+          <select id="tts-voice-select" class="dock-select dock-voice-select"></select>
+        </div>
+
+        <!-- Voice Quick Preview button -->
+        <button id="btn-dock-voice-preview" class="btn-dock-icon" title="Nghe thử giọng này (▶ Thử)">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+        </button>
+
+        <!-- TTS Multi-Engine Settings Modal opener -->
+        <button id="btn-dock-tts-settings" class="btn-dock-icon" title="Cài đặt giọng đọc & Cloud AI (BYOK)">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="4" y1="21" x2="4" y2="14"/>
+            <line x1="4" y1="10" x2="4" y2="3"/>
+            <line x1="12" y1="21" x2="12" y2="12"/>
+            <line x1="12" y1="8" x2="12" y2="3"/>
+            <line x1="20" y1="21" x2="20" y2="16"/>
+            <line x1="20" y1="12" x2="20" y2="3"/>
+            <line x1="1" y1="14" x2="7" y2="14"/>
+            <line x1="9" y1="8" x2="15" y2="8"/>
+            <line x1="17" y1="16" x2="23" y2="16"/>
+          </svg>
+        </button>
+
+        <!-- Speed selector -->
+        <div class="dock-select-wrapper dock-rate-wrapper" title="Tốc độ đọc (Mũi tên Lên/Xuống)">
+          <svg class="dock-select-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <polyline points="12 6 12 12 16 14"/>
+          </svg>
+          <select id="tts-rate-select" class="dock-select dock-rate-select" aria-label="Tốc độ đọc">
+            <option value="0.75">0.75x</option>
+            <option value="0.9">0.9x</option>
+            <option value="1.0" selected>1.0x (Chuẩn)</option>
+            <option value="1.1">1.1x</option>
+            <option value="1.25">1.25x</option>
+            <option value="1.5">1.5x</option>
+            <option value="1.75">1.75x</option>
+            <option value="2.0">2.0x</option>
+          </select>
+        </div>
+
+        <!-- Auto-scroll toggle button (TTS follow) -->
+        <button id="btn-dock-autoscroll" class="btn-dock-pill active" title="Bật/Tắt tự động cuộn màn hình theo giọng đọc TTS">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 5v14"/>
+            <polyline points="19 12 12 19 5 12"/>
+          </svg>
+          <span>Cuộn theo</span>
+        </button>
+
+        <!-- Hands-Free Continuous Auto-Scroll (Text Engine Pro) -->
+        <button id="btn-handsfree-scroll" class="btn-dock-pill" title="Cuộn trang tự động rảnh tay (Phím A hoặc S) - Tự dừng 2s khi chạm hoặc lăn chuột">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M8 2h8a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Z"/>
+            <polyline points="9 11 12 14 15 11"/>
+            <line x1="12" y1="7" x2="12" y2="14"/>
+          </svg>
+          <span id="label-handsfree-btn">Cuộn rảnh tay</span>
+        </button>
+
+        <!-- Mini Speed Adjuster for Hands-Free Auto-scroll -->
+        <div id="autoscroll-speed-controls" class="dock-scroll-stepper" style="display: none;" title="Tốc độ cuộn rảnh tay (10 - 150 px/giây)">
+          <button id="btn-scroll-speed-dec" class="btn-stepper" title="Giảm tốc độ (-10px/s)">-</button>
+          <span id="label-scroll-speed" class="stepper-val">40px/s</span>
+          <button id="btn-scroll-speed-inc" class="btn-stepper" title="Tăng tốc độ (+10px/s)">+</button>
+        </div>
+      </div>
+
+      <!-- CỤM 3: TIỆN ÍCH ĐỌC NHANH (QUICK READING TOOLS) -->
+      <div class="dock-cluster dock-cluster-tools">
+        <!-- Chỉnh cỡ chữ nhanh A- và A+ -->
+        <div class="dock-font-adjuster" title="Chỉnh cỡ chữ nhanh">
+          <button id="btn-dock-font-dec" class="btn-dock-font" title="Giảm cỡ chữ (A-)">A-</button>
+          <span id="dock-font-size-label" class="dock-font-indicator">19px</span>
+          <button id="btn-dock-font-inc" class="btn-dock-font" title="Tăng cỡ chữ (A+)">A+</button>
+        </div>
+
+        <!-- Đổi Theme 1 chạm (Cycle) -->
+        <button id="btn-dock-theme-cycle" class="btn-dock-icon" title="Đổi giao diện nhanh (Sáng / Sepia / Navy / Tối)">
+          <svg id="dock-theme-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="5"/>
+            <line x1="12" y1="1" x2="12" y2="3"/>
+            <line x1="12" y1="21" x2="12" y2="23"/>
+            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+            <line x1="1" y1="12" x2="3" y2="12"/>
+            <line x1="21" y1="12" x2="23" y2="12"/>
+            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+          </svg>
+        </button>
+
+        <!-- Hẹn giờ ngủ & Fade-out (Audiobook & Sleep Suite) -->
+        <button id="btn-dock-sleep-timer" class="btn-dock-icon btn-dock-timer" title="Hẹn giờ tắt đọc sách (Sleep Timer & Fade-out)">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <polyline points="12 6 12 12 16 14"/>
+          </svg>
+          <span id="dock-sleep-timer-badge" class="dock-timer-badge" style="display: none;">30:00</span>
+        </button>
+
+        <!-- Bộ trộn âm thanh môi trường nền (White Noise Mixer) -->
+        <button id="btn-dock-ambient" class="btn-dock-icon btn-dock-ambient" title="Bộ trộn âm thanh môi trường nền (Mưa, Suối, Gió, Lửa)">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 18v-6a9 9 0 0 1 18 0v6"/>
+            <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>
+          </svg>
+          <span id="dock-ambient-indicator" class="dock-ambient-dot" style="display: none;"></span>
+        </button>
+
+        <!-- Chế độ tập trung (Zen Mode) -->
+        <button id="btn-dock-zen-mode" class="btn-dock-icon" title="Chế độ tập trung Zen Mode (Esc để thoát)">
+          <svg id="dock-zen-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M8 3H5a2 2 0 0 0-2 2v3"/>
+            <path d="M21 8V5a2 2 0 0 0-2-2h-3"/>
+            <path d="M3 16v3a2 2 0 0 0 2 2h3"/>
+            <path d="M16 21h3a2 2 0 0 0 2-2v-3"/>
+          </svg>
+        </button>
+
+        <!-- Save the current logical reading position -->
+        <button id="btn-dock-bookmark" class="btn-dock-icon" type="button" aria-label="Lưu bookmark tại vị trí đọc hiện tại" title="Lưu vị trí đọc hiện tại">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M6 4.75A1.75 1.75 0 0 1 7.75 3h8.5A1.75 1.75 0 0 1 18 4.75V21l-6-3.5L6 21V4.75Z"/>
+          </svg>
+          <span class="sr-only">Bookmark</span>
+        </button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ======================================================================
+       MINI FLOATING WIDGET (FAB)
+       ====================================================================== -->
+  <button id="reader-mini-fab" class="reader-mini-fab" style="display: none;" title="Mở rộng thanh điều khiển nổi">
+    <!-- Soundwave animation bars (active when playing) -->
+    <div class="mini-fab-visualizer" id="mini-fab-visualizer">
+      <span class="bar bar-1"></span>
+      <span class="bar bar-2"></span>
+      <span class="bar bar-3"></span>
+      <span class="bar bar-4"></span>
+    </div>
+    <!-- Static icon when idle -->
+    <div class="mini-fab-icon" id="mini-fab-icon">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+        <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+        <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+      </svg>
+    </div>
+    <!-- Progress Badge -->
+    <span class="mini-fab-badge" id="mini-fab-badge">0%</span>
+  </button>
+
+  <!-- ======================================================================
+       MODAL: PASTE RAW TEXT
+       ====================================================================== -->
+  <div id="paste-modal" class="modal-overlay">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <h3>Dán nội dung truyện thô</h3>
+        <button id="btn-close-paste-modal" class="btn-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="form-group">
+        <label for="paste-title-input">Tên tác phẩm *</label>
+        <input type="text" id="paste-title-input" class="form-input" placeholder="Ví dụ: Dế Mèn Phiêu Lưu Ký" required>
+      </div>
+      <div class="form-group">
+        <label for="paste-author-input">Tác giả (tùy chọn)</label>
+        <input type="text" id="paste-author-input" class="form-input" placeholder="Ví dụ: Tô Hoài">
+      </div>
+      <div class="form-group">
+        <label for="paste-content-input">Nội dung văn bản * (Hệ thống sẽ tự nhận diện các Chương 1, Hồi 2... hoặc chia đều nếu không có tiêu đề)</label>
+        <textarea id="paste-content-input" class="form-input form-textarea" placeholder="Dán văn bản truyện vào đây..." required></textarea>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-cancel-paste" class="btn-secondary">Hủy</button>
+        <button id="btn-submit-paste" class="btn-primary">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="20 6 9 17 4 12"/>
+          </svg>
+          <span>Bắt đầu phân tích & Đọc</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       MODAL: BACKUP & RESTORE
+       ====================================================================== -->
+  <div id="backup-modal" class="modal-overlay">
+    <div class="modal-dialog" style="max-width: 480px;">
+      <div class="modal-header">
+        <h3>Sao lưu & Khôi phục dữ liệu</h3>
+        <button id="btn-close-backup-modal" class="btn-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <p style="color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 1.5rem;">
+        Dữ liệu đọc truyện được lưu trữ an toàn trong IndexedDB của máy bạn. Hãy sao lưu ra file JSON để chuyển sang thiết bị khác hoặc lưu trữ dự phòng.
+      </p>
+      <div style="display: flex; flex-direction: column; gap: 1rem;">
+        <button id="btn-export-json" class="btn-primary" style="justify-content: flex-start; padding: 0.85rem 1.25rem;">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          <div style="text-align: left;">
+            <div style="font-weight: 700;">Xuất bản sao lưu (Export JSON)</div>
+            <div style="font-size: 0.78rem; opacity: 0.85;">Tải file chứa toàn bộ sách và tiến độ đọc</div>
+          </div>
+        </button>
+
+        <button id="btn-trigger-import-json" class="btn-secondary" style="justify-content: flex-start; padding: 0.85rem 1.25rem;">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          <div style="text-align: left;">
+            <div style="font-weight: 700;">Nhập bản sao lưu (Import JSON)</div>
+            <div style="font-size: 0.78rem; opacity: 0.85;">Khôi phục lại sách từ file đã sao lưu trước đó</div>
+          </div>
+        </button>
+        <input type="file" id="import-file-input" accept=".json" style="display: none;">
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       MODAL: TTS MULTI-ENGINE & VOICE TUNING SETTINGS
+       ====================================================================== -->
+  <div id="tts-settings-modal" class="modal-overlay">
+    <div class="modal-dialog" style="max-width: 520px;">
+      <div class="modal-header">
+        <div style="display: flex; align-items: center; gap: 0.6rem;">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--primary-color)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+            <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+            <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+          </svg>
+          <h3>Cấu hình Giọng đọc Đa Nguồn (TTS)</h3>
+        </div>
+        <button id="btn-close-tts-settings-modal" class="btn-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Engine Selector Tabs -->
+      <div class="setting-group">
+        <div class="setting-label">Nguồn phát âm (TTS Engine)</div>
+        <div class="tts-engine-tabs">
+          <button type="button" id="tab-engine-browser" class="tts-tab-btn active" data-engine="browser">
+            <span class="tab-title">🌐 Trình duyệt (Miễn phí)</span>
+            <span class="tab-subtitle">Web Speech / Edge Neural</span>
+          </button>
+          <button type="button" id="tab-engine-cloud" class="tts-tab-btn" data-engine="cloud">
+            <span class="tab-title">⚡ Cloud AI (BYOK)</span>
+            <span class="tab-subtitle">FPT AI / OpenAI Cao cấp</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Voice Tuning: Pitch & Speed -->
+      <div class="setting-group" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 0.85rem;">
+        <div style="font-weight: 600; font-size: 0.85rem; margin-bottom: 0.75rem; color: var(--text-primary); display: flex; justify-content: space-between;">
+          <span>🎛️ Bộ điều chỉnh âm sắc (Voice Tuning)</span>
+          <span style="font-size: 0.75rem; color: var(--text-muted);">Biến tấu chất giọng</span>
+        </div>
+
+        <!-- Pitch Slider -->
+        <div style="margin-bottom: 0.75rem;">
+          <div class="setting-label" style="margin-bottom: 0.25rem;">
+            <span>Độ cao/trầm giọng (Pitch):</span>
+            <span id="label-tts-pitch" style="font-weight: 700; color: var(--primary-color);">1.0 (Chuẩn)</span>
+          </div>
+          <input type="range" id="slider-tts-pitch" min="0.5" max="1.5" step="0.05" value="1.0" class="slider-control" title="0.5: Trầm già | 1.0: Chuẩn | 1.5: Thanh cao">
+          <div style="display: flex; justify-content: space-between; font-size: 0.72rem; color: var(--text-muted); margin-top: 2px;">
+            <span>Trầm ấm (0.5x)</span>
+            <span>Chuẩn (1.0x)</span>
+            <span>Thanh cao (1.5x)</span>
+          </div>
+        </div>
+
+        <!-- Speed Slider in Modal -->
+        <div>
+          <div class="setting-label" style="margin-bottom: 0.25rem;">
+            <span>Tốc độ đọc (Rate):</span>
+            <span id="label-modal-tts-rate" style="font-weight: 700; color: var(--primary-color);">1.0x</span>
+          </div>
+          <input type="range" id="slider-modal-tts-rate" min="0.7" max="2.2" step="0.1" value="1.0" class="slider-control">
+          <div style="display: flex; justify-content: space-between; font-size: 0.72rem; color: var(--text-muted); margin-top: 2px;">
+            <span>Chậm (0.7x)</span>
+            <span>Vừa phải (1.0x)</span>
+            <span>Nhanh (2.2x)</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Cloud AI BYOK Configuration Block (Visible when Cloud AI selected) -->
+      <div id="cloud-tts-config-section" class="setting-group" style="display: none; background: rgba(99, 102, 241, 0.05); border: 1px solid rgba(99, 102, 241, 0.25); border-radius: var(--radius-md); padding: 0.85rem;">
+        <div style="font-weight: 600; font-size: 0.85rem; margin-bottom: 0.6rem; color: var(--primary-color);">
+          🔑 Cấu hình Nhà cung cấp AI (Bring Your Own Key)
+        </div>
+
+        <div class="form-group" style="margin-bottom: 0.65rem;">
+          <label for="cloud-provider-select" style="font-size: 0.82rem; margin-bottom: 0.3rem;">Dịch vụ AI</label>
+          <select id="cloud-provider-select" class="form-input">
+            <option value="fpt">FPT AI (Ban Mai, Minh Quang, Thu Dung, Lan Nhi...)</option>
+            <option value="openai">OpenAI TTS (Nova, Shimmer, Onyx, Alloy...)</option>
+          </select>
+        </div>
+
+        <div class="form-group" style="margin-bottom: 0.65rem;">
+          <label for="cloud-api-key-input" style="font-size: 0.82rem; margin-bottom: 0.3rem;">API Key của bạn</label>
+          <div style="position: relative; display: flex; align-items: center;">
+            <input type="password" id="cloud-api-key-input" class="form-input" placeholder="Nhập API Key..." style="padding-right: 2.5rem;">
+            <button type="button" id="btn-toggle-key-visibility" class="btn-icon" style="position: absolute; right: 0.35rem; width: 28px; height: 28px;" title="Hiện / Ẩn Key">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                <circle cx="12" cy="12" r="3"/>
+              </svg>
+            </button>
+          </div>
+          <div style="font-size: 0.72rem; color: var(--text-muted); margin-top: 3px;">
+            Key được lưu an toàn 100% trong trình duyệt (IndexedDB), không gửi về máy chủ ngoài.
+          </div>
+        </div>
+
+        <div class="form-group" style="margin-bottom: 0.65rem;">
+          <label for="cloud-voice-select" style="font-size: 0.82rem; margin-bottom: 0.3rem;">Giọng đọc Cloud AI</label>
+          <select id="cloud-voice-select" class="form-input"></select>
+        </div>
+
+        <div class="form-group" style="margin-bottom: 0;">
+          <label for="cloud-endpoint-input" style="font-size: 0.82rem; margin-bottom: 0.3rem;">Custom Endpoint (Tùy chọn)</label>
+          <input type="text" id="cloud-endpoint-input" class="form-input" placeholder="Mặc định FPT AI: https://api.fpt.ai/h2/tts">
+        </div>
+      </div>
+
+      <!-- Preview Voice Button -->
+      <div style="display: flex; gap: 0.75rem; align-items: center; margin-top: 0.75rem; margin-bottom: 0.75rem;">
+        <button type="button" id="btn-modal-voice-preview" class="btn-secondary" style="flex: 1; padding: 0.65rem 1rem; justify-content: center;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+          <span>Nghe thử câu mẫu</span>
+        </button>
+      </div>
+
+      <!-- Audio Cache Info -->
+      <div style="background: rgba(255, 255, 255, 0.02); border: 1px dashed var(--border-color); border-radius: var(--radius-md); padding: 0.75rem; display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem;">
+        <div>
+          <span style="color: var(--text-secondary);">Bộ nhớ đệm âm thanh:</span>
+          <strong id="label-audio-cache-count" style="color: var(--text-primary); margin-left: 4px;">0</strong> đoạn
+        </div>
+        <button type="button" id="btn-clear-audio-cache" class="btn-secondary" style="padding: 0.35rem 0.65rem; font-size: 0.75rem;" title="Xóa các đoạn âm thanh đã lưu để giải phóng dung lượng">
+          🗑️ Dọn sạch cache
+        </button>
+      </div>
+
+      <!-- Modal Footer -->
+      <div class="modal-footer" style="margin-top: 1.25rem;">
+        <button id="btn-cancel-tts-settings" class="btn-secondary">Đóng</button>
+        <button id="btn-save-tts-settings" class="btn-primary">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="20 6 9 17 4 12"/>
+          </svg>
+          <span>Lưu cấu hình</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       FLOATING TEXT SELECTION TOOLBAR (Text Engine Pro)
+       ====================================================================== -->
+  <div id="selection-toolbar" class="selection-toolbar" style="display: none;" role="toolbar" aria-label="Đánh dấu văn bản">
+    <div class="selection-colors" title="Chọn màu đánh dấu">
+      <button class="hl-color-btn hl-btn-yellow" data-color="yellow" title="Vàng chanh"></button>
+      <button class="hl-color-btn hl-btn-green" data-color="green" title="Xanh mint"></button>
+      <button class="hl-color-btn hl-btn-blue" data-color="blue" title="Xanh pastel"></button>
+      <button class="hl-color-btn hl-btn-orange" data-color="orange" title="Cam đào"></button>
+    </div>
+    <div class="selection-divider"></div>
+    <button id="btn-hl-add-note" class="selection-action-btn" title="Thêm ghi chú cá nhân">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M12 20h9"/>
+        <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+      </svg>
+      <span>Ghi chú</span>
+    </button>
+    <button id="btn-hl-copy-quote" class="selection-action-btn" title="Sao chép trích dẫn chuẩn định dạng">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+      </svg>
+      <span>Trích dẫn</span>
+    </button>
+    <button id="btn-hl-delete" class="selection-action-btn hl-delete-btn" style="display: none;" title="Xóa đánh dấu này">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polyline points="3 6 5 6 21 6"/>
+        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+      </svg>
+      <span>Xóa</span>
+    </button>
+  </div>
+
+  <!-- Note Popover Attached to Selection / Highlight -->
+  <div id="hl-note-popover" class="hl-note-popover" style="display: none;">
+    <div class="popover-header">
+      <span id="note-popover-title">Ghi chú cho trích dẫn</span>
+      <button id="btn-close-note-popover" class="btn-icon-mini" title="Đóng">&times;</button>
+    </div>
+    <textarea id="hl-note-textarea" placeholder="Nhập suy nghĩ, cảm nhận hoặc giải nghĩa của bạn..."></textarea>
+    <div class="popover-actions">
+      <button id="btn-save-hl-note" class="btn-primary btn-mini">Lưu ghi chú</button>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       MODAL: DICTIONARY MANAGER (BỘ LỌC TỪ ĐIỂN & THAY THẾ TỰ ĐỘNG)
+       ====================================================================== -->
+  <div id="dict-modal" class="modal-overlay">
+    <div class="modal-dialog dict-modal-dialog">
+      <div class="modal-header">
+        <div style="display: flex; align-items: center; gap: 0.6rem;">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--primary-color)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>
+          </svg>
+          <h3>Bộ Lọc & Quản Lý Từ Điển Thay Thế</h3>
+        </div>
+        <button id="btn-close-dict-modal" class="btn-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Tầng 1: Global Cleaner Switch -->
+      <div class="dict-cleaner-card">
+        <div class="dict-cleaner-info">
+          <strong>Tầng 1: Bộ lọc rác tự động (Global Junk Cleaner)</strong>
+          <p>Tự động loại bỏ link website, tên miền, lời nhắc convert/donate (Momo, Zalo, Ngân hàng) và khoảng trắng thừa trước khi đọc và nghe TTS.</p>
+        </div>
+        <label class="switch-toggle" title="Bật/Tắt bộ lọc rác tự động">
+          <input type="checkbox" id="chk-global-cleaner" checked>
+          <span class="switch-slider"></span>
+        </label>
+      </div>
+
+      <!-- Tầng 2: Add New Custom Rule Form -->
+      <div class="dict-add-form">
+        <h4>Tầng 2: Thêm quy tắc thay thế mới</h4>
+        <div class="dict-form-row">
+          <div class="dict-input-group">
+            <label for="dict-find-input">Từ gốc (Find) *</label>
+            <input type="text" id="dict-find-input" class="form-input" placeholder="Ví dụ: ta, lão tử, đệ tử...">
+          </div>
+          <div class="dict-input-group">
+            <label for="dict-replace-input">Thay thế bằng (Replace)</label>
+            <input type="text" id="dict-replace-input" class="form-input" placeholder="Ví dụ: tôi, mình, em...">
+          </div>
+        </div>
+        <div class="dict-form-options">
+          <label class="checkbox-label" title="Phân biệt chữ HOA và chữ thường">
+            <input type="checkbox" id="dict-case-chk">
+            <span>Phân biệt hoa/thường</span>
+          </label>
+          <label class="checkbox-label" title="Sử dụng Biểu thức chính quy (Regex)">
+            <input type="checkbox" id="dict-regex-chk">
+            <span>Regex</span>
+          </label>
+          <label class="checkbox-label" title="Chỉ áp dụng quy tắc cho truyện đang đọc">
+            <input type="checkbox" id="dict-scope-chk">
+            <span>Chỉ truyện hiện tại</span>
+          </label>
+          <button id="btn-add-dict-rule" class="btn-primary" style="margin-left: auto;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="12" y1="5" x2="12" y2="19"/>
+              <line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+            <span>Thêm quy tắc</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Rules Table -->
+      <div class="dict-table-container">
+        <div class="dict-table-header-row">
+          <span style="font-weight: 600;">Danh sách quy tắc (<span id="dict-rules-count">0</span>)</span>
+          <div style="display: flex; gap: 0.5rem;">
+            <button id="btn-export-dict-json" class="btn-secondary btn-mini" title="Sao lưu bộ từ điển ra file JSON">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              <span>Xuất JSON</span>
+            </button>
+            <button id="btn-import-dict-json-trigger" class="btn-secondary btn-mini" title="Nhập bộ từ điển từ file JSON">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              <span>Nhập JSON</span>
+            </button>
+            <input type="file" id="dict-import-file-input" accept=".json" style="display: none;">
+          </div>
+        </div>
+        <div class="table-responsive">
+          <table class="dict-table">
+            <thead>
+              <tr>
+                <th>Từ gốc (Find)</th>
+                <th>Thay thế (Replace)</th>
+                <th>Hoa/Thường</th>
+                <th>Regex</th>
+                <th>Phạm vi</th>
+                <th>Bật/Tắt</th>
+                <th>Thao tác</th>
+              </tr>
+            </thead>
+            <tbody id="dict-rules-tbody">
+              <!-- Rendered dynamically -->
+            </tbody>
+          </table>
+        </div>
+        <div id="dict-empty-state" class="dict-empty-state" style="display: none;">
+          Chưa có quy tắc thay thế nào. Hãy tạo quy tắc đầu tiên ở khung phía trên!
+        </div>
+      </div>
+
+      <div class="modal-footer" style="margin-top: 1rem;">
+        <button id="btn-close-dict-done" class="btn-primary" style="margin-left: auto;">Hoàn tất</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       MODAL: SLEEP TIMER & FADE-OUT (Audiobook & Sleep Suite)
+       ====================================================================== -->
+  <div id="sleep-timer-modal" class="modal-overlay">
+    <div class="modal-dialog" style="max-width: 440px;">
+      <div class="modal-header">
+        <div style="display: flex; align-items: center; gap: 0.6rem;">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--primary-color)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <polyline points="12 6 12 12 16 14"/>
+          </svg>
+          <h3>Hẹn Giờ Tắt Đọc Sách</h3>
+        </div>
+        <button id="btn-close-sleep-timer" class="btn-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Current Timer Status Card -->
+      <div id="sleep-timer-status-card" class="timer-status-card" style="display: none;">
+        <div class="timer-countdown-display" id="timer-countdown-val">30:00</div>
+        <div class="timer-status-desc" id="timer-status-desc">Đang đếm ngược... Tự động giảm dần âm lượng trong 30 giây cuối.</div>
+        <button id="btn-cancel-sleep-timer" class="btn-secondary btn-mini" style="margin-top: 0.6rem; color: var(--danger-color); border-color: var(--danger-color);">
+          Hủy hẹn giờ
+        </button>
+      </div>
+
+      <!-- Presets Grid -->
+      <div class="timer-presets-label">Chọn mốc thời gian:</div>
+      <div class="timer-presets-grid">
+        <button class="timer-preset-btn" data-minutes="15">
+          <span class="timer-preset-time">15 phút</span>
+          <span class="timer-preset-sub">Nghe ngắn</span>
+        </button>
+        <button class="timer-preset-btn" data-minutes="30">
+          <span class="timer-preset-time">30 phút</span>
+          <span class="timer-preset-sub">Tiêu chuẩn</span>
+        </button>
+        <button class="timer-preset-btn" data-minutes="45">
+          <span class="timer-preset-time">45 phút</span>
+          <span class="timer-preset-sub">Thư giãn</span>
+        </button>
+        <button class="timer-preset-btn" data-minutes="60">
+          <span class="timer-preset-time">60 phút</span>
+          <span class="timer-preset-sub">1 tiếng</span>
+        </button>
+      </div>
+
+      <!-- Special Option: Chapter End -->
+      <div class="timer-special-card">
+        <button class="timer-chapter-end-btn" id="btn-timer-chapter-end">
+          <div style="text-align: left;">
+            <div style="font-weight: 700; font-size: 0.95rem;">📖 Dừng khi hết chương hiện tại</div>
+            <div style="font-size: 0.82rem; color: var(--text-muted); margin-top: 2px;">Tự động tắt đọc ngay sau khi hoàn thành câu cuối của chương này.</div>
+          </div>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="9 18 15 12 9 6"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Fade-out explanation note -->
+      <div class="timer-info-banner">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--primary-color)" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="16" x2="12" y2="12"/>
+          <line x1="12" y1="8" x2="12.01" y2="8"/>
+        </svg>
+        <span><strong>Hiệu ứng Fade-out 30s:</strong> Âm lượng giọng đọc và âm thanh nền sẽ từ từ giảm dịu nhẹ về 0 trước khi tắt hẳn, chống giật mình khi bạn đang say giấc.</span>
+      </div>
+
+      <div class="modal-footer" style="margin-top: 1rem;">
+        <button id="btn-close-timer-modal" class="btn-primary" style="margin-left: auto;">Đóng</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================================================================
+       MODAL: AMBIENT WHITE NOISE MIXER (Audiobook & Sleep Suite)
+       ====================================================================== -->
+  <div id="ambient-mixer-modal" class="modal-overlay">
+    <div class="modal-dialog" style="max-width: 480px;">
+      <div class="modal-header">
+        <div style="display: flex; align-items: center; gap: 0.6rem;">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--primary-color)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 18v-6a9 9 0 0 1 18 0v6"/>
+            <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>
+          </svg>
+          <h3>Bộ Trộn Âm Thanh Môi Trường Nền</h3>
+        </div>
+        <button id="btn-close-ambient-modal" class="btn-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Master Control Header -->
+      <div class="ambient-master-bar">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+          <span style="font-weight: 600; font-size: 0.9rem;">Âm lượng tổng tiếng nền (Master)</span>
+          <span id="label-ambient-master-val" style="font-weight: 700; font-size: 0.88rem; color: var(--primary-color);">100%</span>
+        </div>
+        <div style="display: flex; gap: 0.75rem; align-items: center;">
+          <input type="range" id="slider-ambient-master" min="0" max="100" value="100" class="form-range" style="flex: 1;">
+          <button id="btn-ambient-stop-all" class="btn-secondary btn-mini" title="Tắt tất cả âm thanh nền">Tắt hết</button>
+        </div>
+      </div>
+
+      <!-- 4 Sound Cards List -->
+      <div class="ambient-tracks-list" id="ambient-tracks-container">
+        <!-- Rendered dynamically via app.js -->
+      </div>
+
+      <div class="ambient-tip-banner">
+        <span>💡 <em>Gợi ý:</em> Mức âm lượng lý tưởng từ <strong>15% - 20%</strong> để tiếng nền hòa quyện êm dịu mà không lấn át lời đọc truyện.</span>
+      </div>
+
+      <div class="modal-footer" style="margin-top: 1rem;">
+        <button id="btn-close-ambient-done" class="btn-primary" style="margin-left: auto;">Hoàn tất</button>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- ======================================================================
+       MODAL: CUSTOM CONFIRMATION DIALOG (No native confirm!)
+       ====================================================================== -->
+  <div id="confirm-modal" class="modal-overlay">
+    <div class="modal-dialog" style="max-width: 420px;" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title" aria-describedby="confirm-modal-message" tabindex="-1">
+      <div class="modal-header">
+        <h3 id="confirm-modal-title">Xác nhận</h3>
+      </div>
+      <p id="confirm-modal-message" style="color: var(--text-secondary); font-size: 0.95rem; margin-bottom: 1.5rem;">
+        Bạn có chắc chắn muốn thực hiện hành động này?
+      </p>
+      <div class="modal-footer">
+        <button id="confirm-modal-btn-cancel" class="btn-secondary">Hủy bỏ</button>
+        <button id="confirm-modal-btn-ok" class="btn-primary" style="background: var(--danger-color);">Đồng ý</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <!-- Main Application Logic Module -->
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -1,0 +1,76 @@
+diff --git a/diagnostics/phase3_before_tts.js.txt b/tts.js
+index 56db173..33b387e 100644
+--- a/diagnostics/phase3_before_tts.js.txt
++++ b/tts.js
+@@ -5,6 +5,7 @@
+  */
+ 
+ import { getCachedAudio, setCachedAudio } from './storage.js';
++import { buildChapterChunkMap } from './chunkMapping.js';
+ import {
+   TTSQueueScheduler,
+   QUEUE_ENTRY_STATES,
+@@ -655,9 +656,10 @@ export class TTSEngine {
+   /**
+    * Loads raw text and slices it into TTS chunk sentences.
+    */
+-  loadText(fullText) {
++  loadText(fullText, chunkMap = null) {
+     this.stop();
+-    this.chunks = this.splitIntoSmartChunks(fullText);
++    this.chunkMap = chunkMap?.sourceText === String(fullText ?? '') ? chunkMap : buildChapterChunkMap(fullText);
++    this.chunks = this.chunkMap.chunks.map(chunk => chunk.text);
+     this.currentIndex = 0;
+     if (this.queueScheduler) {
+       this.queueScheduler.cancelAll();
+@@ -668,49 +670,7 @@ export class TTSEngine {
+    * Breaks text down into natural sentences and clauses suitable for TTS.
+    */
+   splitIntoSmartChunks(text) {
+-    if (!text || !text.trim()) return [];
+-
+-    const rawParagraphs = text.split(/\n+/);
+-    const resultChunks = [];
+-
+-    for (const paragraph of rawParagraphs) {
+-      const cleanPara = paragraph.trim();
+-      if (!cleanPara) continue;
+-
+-      const sentenceRegex = /[^.!?…;:\n]+[.!?…;:\"'”’»\)\]]*|\S+/g;
+-      const rawSentences = cleanPara.match(sentenceRegex) || [cleanPara];
+-
+-      for (let s of rawSentences) {
+-        s = s.trim();
+-        if (!s) continue;
+-
+-        // Bỏ qua hoặc gộp chunk chỉ chứa ký tự đặc biệt/dấu câu không có âm vị phát âm
+-        if (!/[\p{L}\p{N}]/u.test(s)) {
+-          if (resultChunks.length > 0) {
+-            resultChunks[resultChunks.length - 1] += ' ' + s;
+-          }
+-          continue;
+-        }
+-
+-        if (s.length > 220) {
+-          const subClauses = s.split(/,\s+/);
+-          let tempBuf = '';
+-          for (const sub of subClauses) {
+-            if ((tempBuf + sub).length < 180) {
+-              tempBuf += (tempBuf ? ', ' : '') + sub;
+-            } else {
+-              if (tempBuf && /[\p{L}\p{N}]/u.test(tempBuf)) resultChunks.push(tempBuf.trim());
+-              tempBuf = sub;
+-            }
+-          }
+-          if (tempBuf && /[\p{L}\p{N}]/u.test(tempBuf)) resultChunks.push(tempBuf.trim());
+-        } else {
+-          resultChunks.push(s);
+-        }
+-      }
+-    }
+-
+-    return resultChunks;
++    return buildChapterChunkMap(text).chunks.map(chunk => chunk.text);
+   }
+ 
+   /**

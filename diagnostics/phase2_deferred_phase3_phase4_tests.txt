@@ -1,0 +1,58 @@
+segmentation evidence {"readerChunks":["“Xin chào.","”","Câu hai.","Câu ba.","Câu bốn.","Câu năm."],"audioChunks":["“Xin chào.”","Câu hai.","Câu ba.","Câu bốn.","Câu năm."]}
+✖ Reader rendered chunks must equal actual TTS chunks (6.223ms)
+>>> [VietReader] Hoàn thành chương, bắt đầu luồng chuyển chương an toàn tuần tự...
+>>> [VietReader] Khởi động phát TTS cho chương mới từ câu đầu tiên...
+✖ Stop during automatic chapter handoff must cancel future autoplay (8.1283ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 0
+ℹ fail 2
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 72.9951
+
+✖ failing tests:
+
+test at tests\test_codex_phase1_patch_verification.mjs:109:1
+✖ Reader rendered chunks must equal actual TTS chunks (6.223ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+  +   '“Xin chào.',
+  +   '”',
+  -   '“Xin chào.”',
+      'Câu hai.',
+      'Câu ba.',
+      'Câu bốn.',
+      'Câu năm.'
+    ]
+  
+      at TestContext.<anonymous> (file:///C:/Users/hoang/.gemini/antigravity-ide/scratch/personal-reader/tests/test_codex_phase1_patch_verification.mjs:124:12)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ '“Xin chào.', '”', 'Câu hai.', 'Câu ba.', 'Câu bốn.', 'Câu năm.' ],
+    expected: [ '“Xin chào.”', 'Câu hai.', 'Câu ba.', 'Câu bốn.', 'Câu năm.' ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at tests\test_codex_phase1_patch_verification.mjs:128:1
+✖ Stop during automatic chapter handoff must cancel future autoplay (8.1283ms)
+  AssertionError [ERR_ASSERTION]: Stop must invalidate pending chapter autoplay
+  
+  1 !== 0
+  
+      at TestContext.<anonymous> (file:///C:/Users/hoang/.gemini/antigravity-ide/scratch/personal-reader/tests/test_codex_phase1_patch_verification.mjs:152:10)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 0,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

@@ -1,0 +1,308 @@
+Lỗi phát Web Speech API: { error: 'network' }
+✖ setVoice: same effective value must not speak or cancel (5.5136ms)
+✖ setRate: same effective value must not speak or cancel (0.5086ms)
+✖ setPitch: same effective value must not speak or cancel (0.3511ms)
+✖ voiceschanged with recreated objects must preserve selection without restart (0.4926ms)
+Lỗi phát Web Speech API: { error: 'network' }
+Lỗi phát Web Speech API: { error: 'network' }
+Lỗi phát Web Speech API: { error: 'network' }
+Lỗi phát Web Speech API: { error: 'network' }
+Lỗi phát Web Speech API: { error: 'network' }
+Lỗi phát Web Speech API: { error: 'network' }
+✖ onstart then onerror must halt or retry same chunk, never skip six chunks (196.4001ms)
+✖ onend without onstart must not count actual completion (0.8739ms)
+✖ last-chunk error must not emit completed status (0.927ms)
+✖ Pause -> Resume -> onend must advance the retained utterance (12.9925ms)
+✖ paused rate change must apply when resuming (0.5234ms)
+✖ stale captured onend must not clear the new utterance watchdog (1.1063ms)
+✔ duplicate captured terminal callbacks advance exactly once (14.3005ms)
+>>> [VietReader] Watchdog: Phát hiện Web Speech bị treo (5ms). Dừng phát an toàn để bảo vệ bộ nhớ.
+✔ watchdog halts without completion and cleans playback timers (29.6925ms)
+✔ online voice classification and Stop timer cleanup (0.4932ms)
+segmentation evidence {"readerChunks":["“Xin chào.","”","Câu hai.","Câu ba.","Câu bốn.","Câu năm."],"audioChunks":["“Xin chào.”","Câu hai.","Câu ba.","Câu bốn.","Câu năm."]}
+✖ Reader rendered chunks must equal actual TTS chunks (4.9181ms)
+>>> [VietReader] Hoàn thành chương, bắt đầu luồng chuyển chương an toàn tuần tự...
+>>> [VietReader] Khởi động phát TTS cho chương mới từ câu đầu tiên...
+✖ Stop during automatic chapter handoff must cancel future autoplay (10.4621ms)
+ℹ tests 15
+ℹ suites 0
+ℹ pass 3
+ℹ fail 12
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 385.7577
+
+✖ failing tests:
+
+test at tests\test_codex_phase1_patch_verification.mjs:27:3
+✖ setVoice: same effective value must not speak or cancel (5.5136ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+  +   2,
+      1,
+  -   0
+    ]
+  
+      at TestContext.<anonymous> (file:///C:/Users/hoang/.gemini/antigravity-ide/scratch/personal-reader/tests/test_codex_phase1_patch_verification.mjs:32:14)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1201:25)
+      at Test.start (node:internal/test_runner/test:1096:17)
+      at startSubtestAfterBootstrap (node:internal/test_runner/harness:385:17) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ 2, 1 ],
+    expected: [ 1, 0 ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at tests\test_codex_phase1_patch_verification.mjs:27:3
+✖ setRate: same effective value must not speak or cancel (0.5086ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+  +   2,
+      1,
+  -   0
+    ]
+  
+      at TestContext.<anonymous> (file:///C:/Users/hoang/.gemini/antigravity-ide/scratch/personal-reader/tests/test_codex_phase1_patch_verification.mjs:32:14)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1201:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:831:18)
+      at Test.postRun (node:internal/test_runner/test:1330:19)
+      at Test.run (node:internal/test_runner/test:1258:12)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ 2, 1 ],
+    expected: [ 1, 0 ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at tests\test_codex_phase1_patch_verification.mjs:27:3
+✖ setPitch: same effective value must not speak or cancel (0.3511ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+  +   2,
+      1,
+  -   0
+    ]
+  
+      at TestContext.<anonymous> (file:///C:/Users/hoang/.gemini/antigravity-ide/scratch/personal-reader/tests/test_codex_phase1_patch_verification.mjs:32:14)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1201:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:831:18)
+      at Test.postRun (node:internal/test_runner/test:1330:19)
+      at Test.run (node:internal/test_runner/test:1258:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ 2, 1 ],
+    expected: [ 1, 0 ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at tests\test_codex_phase1_patch_verification.mjs:36:1
+✖ voiceschanged with recreated objects must preserve selection without restart (0.4926ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  4 !== 1
+  
+      at TestContext.<anonymous> (file:///C:/Users/hoang/.gemini/antigravity-ide/scratch/personal-reader/tests/test_codex_phase1_patch_verification.mjs:44:12)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1201:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:831:18)
+      at Test.postRun (node:internal/test_runner/test:1330:19)
+      at Test.run (node:internal/test_runner/test:1258:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 4,
+    expected: 1,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests\test_codex_phase1_patch_verification.mjs:48:1
+✖ onstart then onerror must halt or retry same chunk, never skip six chunks (196.4001ms)
+  AssertionError [ERR_ASSERTION]: failed chunks must not be skipped
+  
+  5 !== 0
+  
+      at TestContext.<anonymous> (file:///C:/Users/hoang/.gemini/antigravity-ide/scratch/personal-reader/tests/test_codex_phase1_patch_verification.mjs:60:12)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 5,
+    expected: 0,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests\test_codex_phase1_patch_verification.mjs:64:1
+✖ onend without onstart must not count actual completion (0.8739ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  1 !== 0
+  
+      at TestContext.<anonymous> (file:///C:/Users/hoang/.gemini/antigravity-ide/scratch/personal-reader/tests/test_codex_phase1_patch_verification.mjs:67:57)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1201:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:831:18)
+      at Test.postRun (node:internal/test_runner/test:1330:19)
+      at Test.run (node:internal/test_runner/test:1258:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 0,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests\test_codex_phase1_patch_verification.mjs:70:1
+✖ last-chunk error must not emit completed status (0.927ms)
+  AssertionError [ERR_ASSERTION]: playing,stopped,completed
+      at TestContext.<anonymous> (file:///C:/Users/hoang/.gemini/antigravity-ide/scratch/personal-reader/tests/test_codex_phase1_patch_verification.mjs:73:105)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1201:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:831:18)
+      at Test.postRun (node:internal/test_runner/test:1330:19)
+      at Test.run (node:internal/test_runner/test:1258:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at tests\test_codex_phase1_patch_verification.mjs:76:1
+✖ Pause -> Resume -> onend must advance the retained utterance (12.9925ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  0 !== 1
+  
+      at TestContext.<anonymous> (file:///C:/Users/hoang/.gemini/antigravity-ide/scratch/personal-reader/tests/test_codex_phase1_patch_verification.mjs:78:127)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 0,
+    expected: 1,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests\test_codex_phase1_patch_verification.mjs:81:1
+✖ paused rate change must apply when resuming (0.5234ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  1 !== 1.5
+  
+      at TestContext.<anonymous> (file:///C:/Users/hoang/.gemini/antigravity-ide/scratch/personal-reader/tests/test_codex_phase1_patch_verification.mjs:83:181)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1201:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:831:18)
+      at Test.postRun (node:internal/test_runner/test:1330:19)
+      at Test.run (node:internal/test_runner/test:1258:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 1.5,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests\test_codex_phase1_patch_verification.mjs:86:1
+✖ stale captured onend must not clear the new utterance watchdog (1.1063ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + null
+  - Timeout {
+  -   Symbol(asyncId): 1013,
+  -   Symbol(kAsyncContextFrame): undefined,
+  -   Symbol(kHasPrimitive): false,
+  -   Symbol(refed): false,
+  -   Symbol(triggerId): 44,
+  -   _destroyed: true,
+  -   _idleNext: null,
+  -   _idlePrev: null,
+  -   _idleStart: 268,
+  -   _idleTimeout: -1,
+  -   _onTimeout: null,
+  -   _repeat: null,
+  -   _timerArgs: undefined
+  - }
+  
+      at TestContext.<anonymous> (file:///C:/Users/hoang/.gemini/antigravity-ide/scratch/personal-reader/tests/test_codex_phase1_patch_verification.mjs:88:136)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1201:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:831:18)
+      at Test.postRun (node:internal/test_runner/test:1330:19)
+      at Test.run (node:internal/test_runner/test:1258:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: null,
+    expected: { _idleTimeout: -1, _idlePrev: null, _idleNext: null, _idleStart: 268, _onTimeout: null, _timerArgs: undefined, _repeat: null, _destroyed: true },
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at tests\test_codex_phase1_patch_verification.mjs:109:1
+✖ Reader rendered chunks must equal actual TTS chunks (4.9181ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+  +   '“Xin chào.',
+  +   '”',
+  -   '“Xin chào.”',
+      'Câu hai.',
+      'Câu ba.',
+      'Câu bốn.',
+      'Câu năm.'
+    ]
+  
+      at TestContext.<anonymous> (file:///C:/Users/hoang/.gemini/antigravity-ide/scratch/personal-reader/tests/test_codex_phase1_patch_verification.mjs:124:12)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ '“Xin chào.', '”', 'Câu hai.', 'Câu ba.', 'Câu bốn.', 'Câu năm.' ],
+    expected: [ '“Xin chào.”', 'Câu hai.', 'Câu ba.', 'Câu bốn.', 'Câu năm.' ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at tests\test_codex_phase1_patch_verification.mjs:128:1
+✖ Stop during automatic chapter handoff must cancel future autoplay (10.4621ms)
+  AssertionError [ERR_ASSERTION]: Stop must invalidate pending chapter autoplay
+  
+  1 !== 0
+  
+      at TestContext.<anonymous> (file:///C:/Users/hoang/.gemini/antigravity-ide/scratch/personal-reader/tests/test_codex_phase1_patch_verification.mjs:152:10)
+      at async Test.run (node:internal/test_runner/test:1208:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:831:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 0,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+

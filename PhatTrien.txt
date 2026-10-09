@@ -1,0 +1,55 @@
+Có. Dựa đúng vào những gì **VietReader hiện đã có**, mình nghĩ giai đoạn tiếp theo không nên tiếp tục nhồi thêm những tiện ích rời rạc. Nền tảng hiện tại đã khá đầy đủ về **Reader UI, TTS, Text Engine, highlight/note, auto-scroll, sleep timer, ambient sound và Media Session**. README Hướng phát triển tốt hơn bây giờ là làm VietReader trở thành một **“personal reading system” hoàn chỉnh**, tức là đọc tốt hơn, quản lý thư viện tốt hơn, tìm lại kiến thức tốt hơn và nghe truyện ổn định hơn.
+
+Mình đề xuất các hướng dưới đây, sắp theo mức mình đánh giá là đáng làm:
+
+1. **Search Engine toàn thư viện — rất nên làm tiếp.** Hiện VietReader có tìm truyện ở Library và tìm chương trong TOC, nhưng chưa thấy hệ thống tìm kiếm **nội dung toàn bộ sách**. README Có thể phát triển Global Search: tìm từ/cụm từ trong toàn bộ thư viện → hiển thị `Tên truyện → Chương → đoạn chứa từ khóa`, highlight kết quả, click nhảy đúng vị trí. Sau này có thể thêm lịch sử tìm kiếm và tìm exact/fuzzy. Đây là chức năng rất hợp với IndexedDB hiện tại.
+---- Xong phase 1
+
+2. **Bookmark / Reading Mark độc lập với Highlight.** Highlight hiện thiên về trích dẫn và ghi chú. README Nên có Bookmark kiểu “đánh dấu vị trí để quay lại”, không bắt người dùng phải chọn văn bản. Ví dụ nhấn bookmark ở đoạn 135 → lưu chapter + paragraph/chunk → có Bookmark Hub riêng. Đây là chức năng nhỏ nhưng cực thực dụng.
+---- Đang làm phase 2
+
+3. **Reading History + Timeline.** `books` hiện đã có `lastRead`, progress và current chapter. README Có thể biến thành lịch sử đọc thực sự: hôm nay đọc truyện nào, từ chương nào đến chương nào, bao nhiêu phút, bao nhiêu từ, nghe TTS bao lâu. Sau đó Dashboard cho thấy “Hôm nay”, “7 ngày”, “30 ngày”. Cái này làm ứng dụng có cảm giác hoàn thiện hơn hẳn.
+---- Đang làm phase 3
+
+4. **Reading Statistics / Personal Analytics.** Từ Reading History có thể phát triển thống kê: tổng thời gian đọc, tổng số từ, chương hoàn thành, thời gian nghe TTS, tốc độ đọc trung bình, giờ đọc thường xuyên nhất, truyện đọc nhiều nhất. Có thể thêm heatmap kiểu GitHub nhưng dành cho đọc sách. Đây là hướng rất hợp với “Personal Reader”.
+---- Đang làm phase 4
+
+5. **Reader Session Engine.** Hiện progress được lưu bằng `scrollY` và `currentChunkIndex`, hai trạng thái đã được tách độc lập rất đúng. README Có thể nâng thành lifecycle rõ ràng: `session_start → reading/listening → pause → resume → chapter_complete → session_end`. Nó sẽ trở thành nền tảng cho History, Stats, Resume, Sleep Timer và sau này sync. Mình đánh giá đây là cải tiến kiến trúc có giá trị dài hạn.
+---- Đang làm
+
+6. **Nâng TTS thành Queue/Prefetch Engine cho Cloud AI.** TTS hiện đã có Web Speech + Cloud AI + IndexedDB audio cache + fallback. README Bước tiếp theo có thể là khi đang phát chunk N, hệ thống chuẩn bị audio cho N+1/N+2 trong nền; ưu tiên cache; giới hạn concurrency; hủy request nếu user nhảy chương. Mục tiêu là Cloud TTS chuyển câu gần như không có khoảng trống. Tuy nhiên phải đặc biệt bảo toàn các cơ chế anti-OOM hiện tại. CHANGELOG
+---- Đang làm
+
+7. **TTS Playback Queue cho cả chương.** Hiện mô hình thiên về từng chunk. Có thể tạo queue abstraction nhưng không thay engine cũ: `current`, `next`, `prefetched`, `failed`, `cancelled`. Điều này sẽ giúp seek, preload, retry và chuyển Web Speech ↔ Cloud AI sạch hơn. Đây là bước kiến trúc tốt nếu bạn muốn tiếp tục đầu tư mạnh vào audiobook.
+
+8. **Chapter Preload / Instant Chapter Transition.** Hiện Safe Transition Pipeline cố ý chờ để tránh lỗi callback/RAM. README Không nên bỏ pipeline đó. Nhưng có thể preload **data** chương kế tiếp trước, không khởi tạo TTS trước. Khi hết chương chỉ render dữ liệu đã có sẵn rồi mới chạy pipeline TTS an toàn. Như vậy chuyển chương nhanh hơn nhưng vẫn giữ anti-OOM.
+
+9. **Library Collections / Tags / Shelves.** Hiện Library vẫn chủ yếu là danh sách sách dạng card. README Có thể thêm `Đang đọc`, `Đọc sau`, `Đã hoàn thành`, `Yêu thích`, tag tự tạo như `Tiên hiệp`, `Trinh thám`, `Light Novel`. Thêm sort theo lastRead, title, author, progress, createdAt. Đây là nâng cấp UI/UX có lợi rất rõ.
+
+10. **Book Details Page.** Hiện mở sách gần như đi thẳng vào Reader. Có thể thêm trang/overlay chi tiết: bìa, tên, tác giả, tổng chương, tổng từ, tiến độ, thời gian đọc ước tính, bookmark, notes, lần đọc gần nhất, nút Continue Reading. Nó sẽ làm Library trở thành một hệ thống quản lý sách thay vì chỉ là launcher.
+
+11. **Import Pipeline nâng cao.** Parser hiện đã xử lý TXT/PDF/EPUB và chia chương khá tốt. README Có thể thêm bước **Import Preview** trước khi lưu: preview tên truyện/tác giả, số chương phát hiện, cho chỉnh chapter title, gộp/tách chương sai, bỏ chương rác, preview cleaner result. Đây là một trong những nâng cấp thực tế nhất vì parser tự động không thể đúng 100% với mọi nguồn.
+
+12. **Chapter Editor nhẹ.** Cho phép sửa title hoặc content của chương sau import, nhưng cần giữ nguyên ID/chapterIndex và rebuild sạch TTS/highlight mapping nếu nội dung thay đổi. Nếu làm tính năng này cần thiết kế cẩn thận vì `paragraphIndex` hiện được dùng trong highlight. README
+
+13. **Highlight Anchoring mạnh hơn.** Đây là chỗ mình đặc biệt khuyên nâng cấp. Highlight hiện lưu `paragraphIndex` + `selectedText`. README Cách này dễ lỗi nếu nội dung chương bị cleaner thay đổi hoặc sau này có editor. Có thể nâng sang anchor gồm `selectedText + prefix + suffix + paragraphIndex`, rồi dùng fuzzy recovery nếu vị trí cũ không còn chính xác. Đây là một nâng cấp “ít nhìn thấy nhưng rất quan trọng”.
+
+14. **Quotes & Notes Search.** Quotes Hub hiện đã có danh sách highlight/note và export Markdown. README Có thể nâng thành knowledge hub: search note, filter theo màu/truyện/chương, sort, pin favorite, tag note. Sau này export Markdown theo từng sách hoặc toàn thư viện.
+
+15. **Reading Goals.** Ví dụ mục tiêu `30 phút/ngày`, `5 chương/ngày`, `100.000 từ/tháng`. Kết hợp Reading Statistics và Today progress. Không cần gamification quá mạnh; chỉ cần streak nhẹ và progress ring là đủ.
+
+16. **Focus Session / Pomodoro Reading.** VietReader đã có Zen Mode và Sleep Timer. README Có thể thêm “Focus Reading 25/45/60 phút”, tự động Zen Mode, optionally bật ambient sound, cuối session báo số chương/từ đã đọc. Nó tái sử dụng rất nhiều module đang có.
+
+17. **Smart Sleep Mode.** Sleep Timer hiện đã mạnh với preset, chapter-end và fade-out. README Có thể nâng tiếp: “dừng sau N chương”, “dừng sau N phút nhưng chỉ tại cuối câu”, lưu preset yêu thích, khi người dùng không tương tác lâu thì giảm brightness UI, resume session sáng hôm sau.
+
+18. **Offline/PWA.** VietReader đã là client-side first và phần lớn chạy local. README Có thể biến thành installable PWA với service worker, app manifest, offline shell và update notification. Với kiến trúc hiện tại, đây là hướng rất tự nhiên.
+
+19. **Backup Versioning.** Hiện đã export/import toàn DB JSON. README Có thể thêm `schemaVersion`, metadata, createdAt, appVersion, validate trước import, preview số sách/notes/rules trước restore, lựa chọn `Replace` hoặc `Merge`. Cái này giúp tránh việc bản backup cũ làm hỏng dữ liệu khi schema lớn dần.
+
+20. **Cloud Sync — nhưng chưa cần làm ngay.** Dự án hiện có lợi thế lớn là local-first. Nếu tương lai muốn dùng nhiều thiết bị thì đừng sync nguyên DB ngay từ đầu. Có thể tiến tới event-based sync cho `progress_updated`, `highlight_created`, `bookmark_created`, `setting_changed`. Nhưng theo mình chức năng này nên nằm sau Session Engine + Backup Versioning.
+
+Nếu chọn **5 hướng đáng làm nhất ngay bây giờ**, mình sẽ ưu tiên theo thứ tự:
+
+**Global Full-Text Search → Bookmark System → Reading History/Statistics → Import Preview & Chapter Cleanup → TTS Cloud Prefetch.**
+
+Lý do là 5 thứ này vừa **tận dụng trực tiếp kiến trúc đang có**, vừa tạo khác biệt rõ ràng cho người dùng mà không biến dự án thành một đống tính năng không liên quan. Sau đó mới nên đi sang **PWA, Advanced Library, Knowledge Hub và Cloud Sync**.
